@@ -168,6 +168,12 @@ def subscribe_message(
 class Transport(Protocol):
     """Minimal transport contract. Inject a WebSocket client or a replay."""
 
+    #: True for a live socket, where `recv` returning None means "no data yet"
+    #: and must not end the stream. False for a replay, where None means
+    #: "exhausted". A live feed that treats an idle timeout as end-of-stream
+    #: dies on the first quiet minute, which looks like a market outage.
+    is_live: bool
+
     def connect(self) -> None: ...
 
     def send(self, data: bytes) -> None: ...
@@ -184,6 +190,8 @@ class ReplayTransport:
     entry simulates a timeout with no data. Heartbeat strings are passed through
     as `str` to exercise the skip path.
     """
+
+    is_live = False
 
     def __init__(self, frames: Iterable[bytes | str | None]) -> None:
         self._frames = list(frames)
@@ -328,23 +336,67 @@ class SmartStreamConnector:
         on_trade: Callable[[RoutedTrade], None],
         max_frames: int | None = None,
         clock: Callable[[], float] = time.monotonic,
+        max_seconds: float | None = None,
+        reconnect: bool = True,
+        max_reconnects: int = 5,
     ) -> ConnectorStats:
-        """Consume frames until the transport is exhausted or max_frames is hit.
+        """Consume frames until the transport is exhausted or a limit is hit.
 
         On every (re)connect the subscriptions are re-sent. A socket that
         reconnects without resubscribing produces silence, which is
         indistinguishable from a quiet market.
+
+        `max_seconds` is the wall-clock budget for a live run: the loop stops
+        when it elapses, so a live session cannot run forever by accident.
+        `reconnect` retries a dropped socket up to `max_reconnects` times with
+        backoff, resubscribing each time.
         """
+        started = clock()
         for index, session in enumerate(self.plan.sessions):
             if not session:
                 continue
-            transport = self.transport_factory(index)
-            transport.connect()
-            self._subscribe(transport, index)
-            try:
-                self._consume(transport, on_trade, max_frames, clock)
-            finally:
-                transport.close()
+            attempt = 0
+            while True:
+                transport = self.transport_factory(index)
+                try:
+                    transport.connect()
+                except Exception as exc:
+                    self.stats.protocol_errors += 1
+                    if self.on_error is not None:
+                        self.on_error(exc)
+                    attempt += 1
+                    if not reconnect or attempt > max_reconnects:
+                        break
+                    self.stats.reconnects += 1
+                    time.sleep(min(2**attempt, 30))
+                    continue
+                self._subscribe(transport, index)
+                try:
+                    self._consume(
+                        transport, on_trade, max_frames, clock,
+                        deadline=None if max_seconds is None else started + max_seconds,
+                    )
+                except Exception as exc:
+                    # A live socket dies in many ways (reset, SSL, decode of a
+                    # torn frame). Reconnect rather than losing the session.
+                    self.stats.protocol_errors += 1
+                    if self.on_error is not None:
+                        self.on_error(exc)
+                finally:
+                    transport.close()
+
+                attempt += 1
+                # Reconnect only applies to a live socket. A replay is exhausted
+                # on purpose, so retrying it would sleep through the backoff and
+                # then replay nothing.
+                if not reconnect or not getattr(transport, "is_live", False):
+                    break
+                if attempt > max_reconnects:
+                    break
+                if max_seconds is not None and clock() - started >= max_seconds:
+                    break
+                self.stats.reconnects += 1
+                time.sleep(min(2**attempt, 30))
         return self.stats
 
     def _consume(
@@ -353,13 +405,24 @@ class SmartStreamConnector:
         on_trade: Callable[[RoutedTrade], None],
         max_frames: int | None,
         clock: Callable[[], float],
+        deadline: float | None = None,
     ) -> None:
+        idle_since: float | None = None
         while True:
             if max_frames is not None and self.stats.frames >= max_frames:
                 return
+            if deadline is not None and clock() >= deadline:
+                return
             frame = transport.recv(timeout=self.heartbeat_interval)
             if frame is None:
-                return
+                if not getattr(transport, "is_live", False):
+                    return
+                # Live socket: None is an idle timeout, not end-of-stream.
+                if idle_since is None:
+                    idle_since = clock()
+                self.maybe_heartbeat(transport, clock)
+                continue
+            idle_since = None
             self.stats.frames += 1
             self._handle_frame(frame, on_trade, transport, clock)
 

@@ -31,6 +31,8 @@ class WebSocketTransport:
     testable without a socket.
     """
 
+    is_live = True
+
     def __init__(
         self,
         auth_token: str,
@@ -103,6 +105,8 @@ class FileTransport:
     heartbeat. Recording a live session once and keeping it as a fixture is the
     cheapest way to make ingestion regressions reproducible.
     """
+
+    is_live = False
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)

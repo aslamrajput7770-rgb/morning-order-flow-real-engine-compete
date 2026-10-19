@@ -637,3 +637,130 @@ class TestEndToEndIngestion:
         conn.run(on_trade=lambda rt: chart.add(rt.trade))
         assert chart.session_volume == 25.0
         assert chart.cumulative_delta == pytest.approx(25.0)
+
+
+
+# ====================================================== live transport semantics
+class _FakeTransport:
+    """Fake socket. `is_live` decides whether idle means 'wait' or 'done'."""
+
+    def __init__(self, script, is_live=True, clock=None):
+        self.script = list(script)
+        self.is_live = is_live
+        self._clock = clock
+        self.i = 0
+        self.sent = []
+        self.closed = False
+        self.connected = False
+
+    def connect(self):
+        self.connected = True
+
+    def send(self, data):
+        self.sent.append(data)
+
+    def recv(self, timeout=None):
+        if self._clock is not None:
+            self._clock[0] += 5.0
+        if self.i < len(self.script):
+            f = self.script[self.i]
+            self.i += 1
+            return f
+        return None  # idle
+
+    def close(self):
+        self.closed = True
+
+
+class TestLiveTransportSemantics:
+    def _conn(self, transport):
+        mapper = build_indian_token_map()
+        plan = build_plan([(TokenNamespace.NSE_FO, 26000)])
+        return SmartStreamConnector(plan, mapper, lambda i: transport)
+
+    def test_idle_timeout_does_not_end_a_live_stream(self):
+        """A quiet patch on a live socket must not stop the feed.
+
+        Replay: None means 'exhausted', stop. Live: None means 'no data yet',
+        keep waiting. Treating them the same kills the feed on the first quiet
+        minute, which looks exactly like a market outage.
+        """
+        clock = [0.0]
+        t = _FakeTransport([None, None, encode_tick(snap_spec()), None], is_live=True, clock=clock)
+        got = []
+        self._conn(t).run(on_trade=got.append, max_seconds=100, clock=lambda: clock[0])
+        assert len(got) == 1, "the trade after the idle period must still arrive"
+
+    def test_replay_none_still_ends_the_stream(self):
+        """The offline path must keep terminating on exhaustion."""
+        t = _FakeTransport([encode_tick(snap_spec()), None], is_live=False)
+        got = []
+        self._conn(t).run(on_trade=got.append)
+        assert len(got) == 1
+        assert t.closed is True
+
+    def test_replay_is_not_retried(self):
+        """A replay must not enter the reconnect backoff (which sleeps for real)."""
+        t = _FakeTransport([encode_tick(snap_spec())], is_live=False)
+        clock = [0.0]
+        stats = self._conn(t).run(on_trade=lambda rt: None, clock=lambda: clock[0])
+        assert stats.reconnects == 0
+
+    def test_live_heartbeat_sent_while_idle(self):
+        clock = [0.0]
+        t = _FakeTransport([None] * 20, is_live=True, clock=clock)
+        conn = SmartStreamConnector(
+            build_plan([(TokenNamespace.NSE_FO, 26000)]),
+            build_indian_token_map(),
+            lambda i: t,
+            heartbeat_interval=10.0,
+        )
+        conn.run(on_trade=lambda rt: None, max_seconds=30, clock=lambda: clock[0])
+        assert any(b"ping" in s for s in t.sent)
+
+    def test_max_seconds_bounds_a_live_run(self):
+        clock = [0.0]
+        t = _FakeTransport([encode_tick(snap_spec())] * 1000, is_live=True, clock=clock)
+        self._conn(t).run(on_trade=lambda rt: None, max_seconds=20, clock=lambda: clock[0])
+        assert t.closed is True
+
+
+# ==================================================================== totp
+class TestTOTP:
+    """RFC 6238 Appendix B vectors. These prove the login code is correct."""
+
+    SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"  # base32 of "12345678901234567890"
+
+    @pytest.mark.parametrize(
+        "at_time,expected",
+        [
+            (59, "94287082"),
+            (1111111109, "07081804"),
+            (1111111111, "14050471"),
+            (1234567890, "89005924"),
+            (2000000000, "69279037"),
+            (20000000000, "65353130"),
+        ],
+    )
+    def test_rfc6238_vectors(self, at_time, expected):
+        from orderflow.feed import totp
+
+        assert totp(self.SECRET, at_time=at_time, digits=8) == expected
+
+    def test_six_digits_and_zero_padding(self):
+        from orderflow.feed import totp
+
+        code = totp(self.SECRET, at_time=1111111109)
+        assert len(code) == 6 and code.isdigit()
+
+    def test_secret_with_spaces_and_padding_tolerated(self):
+        from orderflow.feed import totp
+
+        spaced = "GEZD GNBV GY3T QOJQ GEZD GNBV GY3T QOJQ"
+        assert totp(spaced, at_time=59, digits=8) == totp(self.SECRET, at_time=59, digits=8)
+
+    def test_bad_secret_raises(self):
+        from orderflow.feed import totp
+
+        with pytest.raises(ValueError, match="base32"):
+            totp("not!valid!base32!!", at_time=59)

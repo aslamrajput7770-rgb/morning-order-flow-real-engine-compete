@@ -243,12 +243,29 @@ conn = SmartStreamConnector(plan, mapper, lambda i: ReplayTransport(frames))
 conn.run(on_trade=lambda rt: chart.add(rt.trade))
 ```
 
-For live data, swap the transport:
+For live data there is a ready runner. Credentials come from the environment,
+never from code:
+
+```bash
+export ANGEL_API_KEY=... ANGEL_CLIENT_CODE=... ANGEL_PIN=... ANGEL_TOTP_SECRET=...
+python3 live_feed.py --dry-run                                   # no socket opened
+python3 live_feed.py --minutes 5 --instruments "NSE_FO:26000" --record capture.txt
+```
+
+`--record` writes every raw frame to disk; replay it offline with
+`FileTransport` as a permanent regression fixture.
+
+Or swap the transport yourself (`pip install websocket-client`):
 
 ```python
-from orderflow.feed import WebSocketTransport   # needs: pip install websocket-client
-transport = WebSocketTransport(auth_token=..., api_key=..., client_code=..., feed_token=...)
+from orderflow.feed import WebSocketTransport
+transport = WebSocketTransport(auth_token=jwt, api_key=..., client_code=..., feed_token=...)
 ```
+
+TOTP is implemented in stdlib and checked against the RFC 6238 vectors. The
+runner re-sends subscriptions on reconnect, sends `ping` every 10s, distinguishes
+an idle socket from an exhausted replay, and bounds the run by wall clock so a
+live session cannot run away.
 
 Four things this layer has to get right, and does:
 

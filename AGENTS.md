@@ -12,6 +12,11 @@ python3 -m pytest tests -q    # 184 tests, no mocks, no network
 python3 demo.py               # engine tour; writes footprint.html
 python3 demo_indian.py        # NSE + MCX sessions, reset, token map
 python3 demo_feed.py          # SmartStream ingestion, offline, simulated bytes
+
+# Live (needs credentials in the environment, never in code or chat):
+export ANGEL_API_KEY=... ANGEL_CLIENT_CODE=... ANGEL_PIN=... ANGEL_TOTP_SECRET=...
+python3 live_feed.py --dry-run          # validate plan + session, no socket
+python3 live_feed.py --minutes 1 --record capture.txt
 ```
 
 ## Ingestion layer (orderflow/feed/)
@@ -58,6 +63,16 @@ requires it.
 - The official SDK maps its parsed buy list to a key named `best_5_sell_data`
   and vice versa. `_parse_best_five` maps bid -> bid; validate against a live
   packet dump before trusting the direction in production.
+- `Transport.is_live` decides what `recv() is None` means. On a replay it means
+  exhausted and ends the loop; on a live socket it means idle and the loop keeps
+  waiting. Treating them the same kills a live feed on the first quiet minute.
+  Reconnect only applies to live transports; a replay is never retried.
+- Credentials come from the environment (`ANGEL_*`). Never in code, never in a
+  chat message, never committed. `live_feed.py` prints only masked values.
+- TOTP is stdlib (`orderflow/feed/totp.py`), verified against the RFC 6238
+  vectors in the tests. No `pyotp` dependency.
+- `websocket-client` is optional and imported lazily. Importing
+  `orderflow.feed` must never require it.
 
 ## Indian market invariants (do not "simplify" these)
 

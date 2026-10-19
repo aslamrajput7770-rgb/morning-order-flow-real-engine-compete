@@ -60,6 +60,7 @@ from .tick_reader import (
 )
 from .simulator import TickSpec, encode_stream, encode_tick
 from .transports import FileTransport, WebSocketTransport, record_frames
+from .totp import totp
 from ..instruments import TokenNamespace
 
 __all__ = [
@@ -107,4 +108,6 @@ __all__ = [
     "WebSocketTransport",
     "FileTransport",
     "record_frames",
+    # auth helper
+    "totp",
 ]
