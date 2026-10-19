@@ -8,10 +8,56 @@ Pure-Python order-flow / footprint analytics engine. Stdlib only at runtime;
 ## Commands
 
 ```bash
-python3 -m pytest tests -q    # 127 tests, no mocks
+python3 -m pytest tests -q    # 184 tests, no mocks, no network
 python3 demo.py               # engine tour; writes footprint.html
 python3 demo_indian.py        # NSE + MCX sessions, reset, token map
+python3 demo_feed.py          # SmartStream ingestion, offline, simulated bytes
 ```
+
+## Ingestion layer (orderflow/feed/)
+
+Angel One SmartStream V2, decoded from raw bytes. No socket in the core path:
+
+```
+bytes -> protocol.py    decode, no I/O
+      -> tick_reader.py cumulative volume -> incremental prints, side inference
+      -> connector.py   subscription planning, routing, reconnect, heartbeat
+      -> session_chart  footprint, delta, profile, daily reset
+```
+
+`ReplayTransport` and `FileTransport` replace the socket, so the whole path is
+offline-testable. `WebSocketTransport` is the only place that touches a socket
+and it imports `websocket-client` lazily, so importing `orderflow.feed` never
+requires it.
+
+## SmartStream invariants (do not "simplify" these)
+
+- Prices are **scaled integers**. NSE/BSE/MCX use 100, CDE uses 10^7. Always
+  divide by `raw.scale`. The tick grid does **not** catch a missing division:
+  2400005 is an exact multiple of 0.05, so it looks perfectly aligned.
+  `TickReader` raises `PriceScaleError` on an implausible price instead.
+- `volume_trade_for_the_day` is **cumulative**. The footprint needs the
+  increment (`volume - previous_volume`). Feeding the cumulative value puts the
+  whole day into every bar.
+- A cumulative volume **below** the previous one is a session roll or feed
+  restart, not a negative print. Take the new value as the increment.
+- Unchanged volume means **no trade**: a quote update. Emit nothing, or the
+  footprint fills with zero prints.
+- The feed has **no aggressor flag and no trade id**. Side is inferred: quote
+  rule (print vs best bid/ask) first, tick rule fallback, `Side.UNKNOWN` when
+  neither applies. Never invent a side; `UNKNOWN` splits 50/50 downstream.
+- **LTP mode carries no volume** and cannot build a footprint.
+  `require_volume_capable_mode` guards this; the failure mode is a silently
+  empty chart.
+- Limit is **1000 token subscriptions per socket**, 3 sockets per client.
+  `build_plan` splits and dedupes. Subscribe in one mode per token: two modes
+  count as two subscriptions.
+- Re-send subscriptions on every reconnect. A reconnected socket with no
+  subscriptions is silent, which looks exactly like a dead market.
+- Heartbeats are non-binary (the literal `ping`). Skip them; never parse them.
+- The official SDK maps its parsed buy list to a key named `best_5_sell_data`
+  and vice versa. `_parse_best_five` maps bid -> bid; validate against a live
+  packet dump before trusting the direction in production.
 
 ## Indian market invariants (do not "simplify" these)
 

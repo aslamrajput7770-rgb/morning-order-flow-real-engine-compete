@@ -91,6 +91,22 @@ class FootprintBar:
         return sum(l.ask_vol for l in self.levels.values())
 
     @property
+    def sell_volume(self) -> float:
+        """Volume that traded at the bid (seller-aggressor).
+
+        Same quantity as `bid_volume`, named for the side of the *trader* rather
+        than the side of the book. Both names are kept because footprint UIs
+        label this column "Sell" while the data structure calls the book side
+        "bid", and mixing them up inverts the delta.
+        """
+        return self.bid_volume
+
+    @property
+    def buy_volume(self) -> float:
+        """Volume that traded at the ask (buyer-aggressor). See `sell_volume`."""
+        return self.ask_volume
+
+    @property
     def total_volume(self) -> float:
         return self.bid_volume + self.ask_volume
 

@@ -123,6 +123,7 @@ orderflow/
 tests/
   test_engine.py        69 tests, engine behaviour
   test_indian_market.py 58 tests, tick sizes, sessions, tokens, reset
+  test_ingestion.py     57 tests, SmartStream protocol, reader, connector, e2e
 demo.py          end-to-end tour on seeded synthetic tape
 demo_indian.py   NSE + MCX sessions, reset, token map, tick-grid book lookup
 ```
@@ -209,13 +210,68 @@ Runs two NSE Nifty sessions and two MCX gold sessions, shows the reset firing,
 prints the seasonal MCX close, and demonstrates the float-equality trap in book
 lookup.
 
+## Angel One SmartStream ingestion
+
+`orderflow/feed/` decodes Angel One SmartStream V2 binary packets into the
+engine's `Trade` stream. The socket is injected, so the whole path runs offline.
+
+```
+bytes -> protocol.py    decode, no I/O
+      -> tick_reader.py cumulative volume -> incremental prints, side inference
+      -> connector.py   subscription planning, routing, reconnect, heartbeat
+      -> session_chart  footprint, delta, profile, daily reset
+```
+
+```python
+from orderflow import Market, MarketCalendar, SessionChart, NIFTY_FUT, build_indian_token_map
+from orderflow.feed import (ExchangeType, SubscriptionMode, TickSpec, TokenNamespace,
+                            build_plan, encode_tick, ReplayTransport,
+                            SmartStreamConnector)
+
+mapper = build_indian_token_map()
+plan = build_plan([(TokenNamespace.NSE_FO, 26000)], mode=SubscriptionMode.SNAP_QUOTE)
+chart = SessionChart(NIFTY_FUT.grid(), MarketCalendar(Market.NSE, segment="NSE_FNO"),
+                     bar_seconds=300)
+
+# Offline: real binary packets, no broker.
+frames = [encode_tick(TickSpec(mode=SubscriptionMode.SNAP_QUOTE,
+                               exchange_type=ExchangeType.NSE_FO, token="26000",
+                               exchange_timestamp_ms=..., last_traded_price=24000.05,
+                               volume_trade_for_the_day=1000,
+                               bids=((24000.00, 150),), asks=((24000.05, 75),)))]
+conn = SmartStreamConnector(plan, mapper, lambda i: ReplayTransport(frames))
+conn.run(on_trade=lambda rt: chart.add(rt.trade))
+```
+
+For live data, swap the transport:
+
+```python
+from orderflow.feed import WebSocketTransport   # needs: pip install websocket-client
+transport = WebSocketTransport(auth_token=..., api_key=..., client_code=..., feed_token=...)
+```
+
+Four things this layer has to get right, and does:
+
+1. **Prices are scaled integers.** NSE/BSE/MCX divide by 100, CDE by 10^7. The
+   tick grid cannot catch a missing division (2400005 is a clean multiple of
+   0.05), so `TickReader` raises `PriceScaleError` on an implausible price.
+2. **Volume is cumulative.** The reader differences it into prints, treats a
+   decrease as a session roll rather than a negative print, and emits nothing
+   when the volume is unchanged (a quote update is not a trade).
+3. **There is no aggressor flag.** Side is inferred by the quote rule (print vs
+   best bid/ask), then the tick rule, and left `Side.UNKNOWN` when neither
+   applies. That is the honest limit of this feed.
+4. **Heartbeats, limits and reconnects.** Non-binary frames are skipped; 1000
+   subscriptions per socket across at most 3 sockets are planned automatically;
+   subscriptions are re-sent on every reconnect.
+
 ## Not included
 
-- Live data adapters (broker/exchange specific). The `TokenMapper` is the seam:
-  your Angel One / Kite / Fyers adapter resolves tokens to `Instrument`s and
-  emits `Trade`s. Real deployments load the token numbers from the broker's
-  instrument master file at startup; `build_indian_token_map()` is a working
-  stand-in with placeholder ids.
+- Broker authentication and the instrument master file. `WebSocketTransport`
+  takes the tokens from the login response; `login()` in `transports.py` is a
+  minimal REST helper. Load real token numbers from the broker's instrument
+  master at startup; `build_indian_token_map()` is a working stand-in with
+  placeholder ids.
 - Order routing (SuperDOM models ladder state and fills; sending orders is the
   adapter's job)
 - Historical data storage
