@@ -5,8 +5,21 @@ behind a Sierra Chart / Jigsaw / Bookmap style tool. It takes a stream of trades
 and produces footprints, delta, volume profiles, imbalances, absorption and the
 supporting indicators.
 
-No data feed, no UI framework, no dependencies beyond the standard library
-(`pytest` only for tests).
+The calculation core and the Angel One SmartStream ingestion layer are pure
+standard library. `pytest` is needed for tests; `websocket-client` is optional
+and only for live streaming. Everything else runs offline with no network.
+
+## Install
+
+```bash
+pip install pytest              # tests
+pip install websocket-client    # optional, live streaming only
+```
+
+```bash
+python3 -m pytest tests -q      # 198 tests, no mocks, no network
+python3 demo_feed.py            # full ingestion path on simulated packets
+```
 
 ## Why this shape
 
