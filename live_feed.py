@@ -8,19 +8,29 @@ Reads credentials from the environment, never from arguments or code:
     ANGEL_TOTP_SECRET   the base32 secret behind your authenticator app
     ANGEL_FEED_TOKEN    optional; from a previous login response
 
+The instrument master is required. Live subscriptions need real token numbers,
+and the placeholder ids in `build_indian_token_map()` are not real: a live
+subscription to them is accepted, streams nothing, and reports no error.
+
+    python3 fetch_instruments.py             # once, ~36 MB, refreshed daily
+
 Usage:
 
-    # 1. Check the session is open and the plan is sane, touch nothing.
-    python3 live_feed.py --dry-run
+    # 1. Check credentials, session and plan; touch nothing.
+    python3 live_feed.py --underlying NIFTY --dry-run
 
-    # 2. Stream for 60 seconds, record every frame to disk, print a summary.
-    python3 live_feed.py --minutes 1 --record capture.txt
+    # 2. Stream for five minutes, record every frame, print a summary.
+    python3 live_feed.py --underlying NIFTY --minutes 5 --record capture.txt
 
-    # 3. Subscribe to specific instruments.
-    python3 live_feed.py --instruments "NSE_FO:26000,MCX_FO:42809" --minutes 5
+    # 3. Subscribe by explicit token.
+    python3 live_feed.py --instruments "NSE_FO:48704,MCX_FO:495213" --minutes 5
 
-The runner never prints a token, and never writes one to disk. The recording
-contains market data only.
+    # 4. Offline smoke test without the master (returns no live data).
+    python3 live_feed.py --instruments "NSE_FO:26000" --allow-placeholder-tokens --dry-run
+
+The runner never prints a credential, and never writes one to disk. The
+recording contains market data only. Exit code is non-zero when the feed
+produced no data, so a silent subscription cannot pass as a quiet market.
 """
 
 from __future__ import annotations
@@ -38,6 +48,8 @@ from orderflow.feed import (
     require_volume_capable_mode,
     totp,
 )
+from orderflow.instruments import UnknownToken
+from orderflow.instrument_master import build_live_token_map, upcoming_futures
 from orderflow.feed.transports import WebSocketTransport, record_frames
 
 
@@ -102,10 +114,82 @@ def parse_instruments(spec: str) -> list[tuple[TokenNamespace, int]]:
     return out
 
 
+def resolve_instruments(args, mode) -> tuple:
+    """Turn CLI arguments into (namespace, token) pairs, and the mapper.
+
+    Live tokens must come from the instrument master. The placeholder ids in
+    `build_indian_token_map()` are not real: a live subscription to them is
+    accepted, returns no data at all, and reports no error. Two of the five do
+    not exist in the master. So an unknown token is a hard failure here, not a
+    warning.
+    """
+    import pathlib
+
+    want_master = not args.allow_placeholder_tokens
+    mapper = None
+    if want_master:
+        path = pathlib.Path(args.master)
+        if not path.exists():
+            raise SystemExit(
+                f"instrument master not found at {path}\n"
+                "Live subscriptions need real token numbers. Run:\n"
+                "    python3 fetch_instruments.py\n"
+                "or pass --allow-placeholder-tokens to try anyway (returns no data)."
+            )
+        mapper, stats = build_live_token_map(path)
+        print(f"instrument master: {stats}")
+
+    pairs = []
+    if args.underlying:
+        if mapper is None:
+            raise SystemExit("--underlying needs the instrument master")
+        for name in args.underlying.split(","):
+            got = upcoming_futures(mapper, name.strip(), limit=1)
+            if not got:
+                raise SystemExit(f"no unexpired future found for {name.strip()!r}")
+            ns, tok, inst = got[0]
+            print(f"resolved {name.strip().upper():<12} -> {inst.symbol} "
+                  f"token={tok} exp={inst.expiry} tick={inst.tick_size}")
+            pairs.append((ns, tok))
+
+    if args.instruments:
+        pairs.extend(parse_instruments(args.instruments))
+
+    if not pairs:
+        raise SystemExit(
+            "no instruments given. Use --underlying NIFTY, or "
+            "--instruments NSE_FO:48704. See `python3 fetch_instruments.py --show NIFTY`."
+        )
+
+    if mapper is not None:
+        for ns, tok in pairs:
+            try:
+                inst = mapper.by_token(ns, tok)
+            except UnknownToken:
+                raise SystemExit(
+                    f"token {tok} in {ns.value} is not in the instrument master.\n"
+                    "Subscribing to an unknown token returns no data and reports no "
+                    "error, so this is refused. Find the real token with:\n"
+                    f"    python3 fetch_instruments.py --show <UNDERLYING>"
+                )
+            print(f"verified  {ns.value}:{tok}  {inst.symbol}  "
+                  f"exp={inst.expiry}  tick={inst.tick_size}")
+
+    return mapper, pairs
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Live Angel One SmartStream feed")
-    ap.add_argument("--instruments", default="NSE_FO:26000,MCX_FO:42809",
-                    help="comma-separated NAMESPACE:TOKEN")
+    ap.add_argument("--instruments", default=None,
+                    help="comma-separated NAMESPACE:TOKEN, e.g. NSE_FO:48704")
+    ap.add_argument("--underlying", default=None,
+                    help="resolve the nearest future by underlying, e.g. NIFTY "
+                         "(needs instruments.json)")
+    ap.add_argument("--master", default="instruments.json",
+                    help="instrument master file; required for live tokens")
+    ap.add_argument("--allow-placeholder-tokens", action="store_true",
+                    help="permit the offline placeholder tokens (they return NO data "
+                         "on a live feed and report no error)")
     ap.add_argument("--mode", default="SNAP_QUOTE",
                     choices=["QUOTE", "SNAP_QUOTE", "DEPTH"])
     ap.add_argument("--minutes", type=float, default=1.0, help="how long to stream")
@@ -119,7 +203,8 @@ def main(argv=None) -> int:
     # LTP has no volume and would produce a silently empty footprint.
     require_volume_capable_mode(mode)
 
-    instruments = parse_instruments(args.instruments)
+    mapper, resolved = resolve_instruments(args, mode)
+    instruments = resolved
     plan = build_plan(instruments, mode=mode)
     print(f"plan: {plan.total} subscriptions across {len(plan.sessions)} connection(s)")
     for i, sess in enumerate(plan.sessions):
@@ -160,8 +245,6 @@ def main(argv=None) -> int:
         print(f"login response had no jwtToken: {list(session)}", file=sys.stderr)
         return 1
     print("login ok, jwt received")
-
-    mapper = build_indian_token_map()
 
     # A chart per instrument, so cumulative delta resets per instrument per day.
     charts: dict = {}
@@ -254,6 +337,46 @@ def main(argv=None) -> int:
 
     print("\nReminder: SmartStream has no aggressor flag. Sides are inferred "
           "(quote rule, then tick rule). Watch the UNKNOWN share before trusting delta.")
+
+    return liveness_verdict(stats, charts)
+
+
+def liveness_verdict(stats, charts) -> int:
+    """Say plainly whether the run actually produced market data.
+
+    A silent feed is the failure this whole runner is built to surface. The
+    socket connects, the login succeeds, the subscription is accepted, and no
+    data arrives. Every count is zero and nothing looks wrong. If this function
+    does not say so, the run reads as a quiet market instead of a broken setup.
+
+    Returns a process exit code: 0 when data arrived, 1 when it did not.
+    """
+    print("\n--- liveness ---")
+    if stats.frames == 0:
+        print("  NO FRAMES RECEIVED. The socket connected but the feed sent nothing.")
+        print("  Most likely: the session is closed (NSE 09:15-15:40, MCX 09:00-23:30")
+        print("  IST), or the instrument master is stale and the token is not live.")
+        return 1
+    if stats.ticks == 0:
+        print(f"  {stats.frames} frames arrived but decoded to ZERO ticks.")
+        print(f"  protocol errors={stats.protocol_errors}. A layout mismatch is the")
+        print("  likely cause; re-check the offsets in orderflow/feed/protocol.py.")
+        return 1
+    if stats.trades == 0:
+        print(f"  {stats.ticks} ticks decoded but produced no trades. Volume was flat,")
+        print("  which is normal in a thin market but suspicious over minutes.")
+    if stats.unmapped:
+        print(f"  {stats.unmapped} packets carried an UNMAPPED token and were dropped.")
+        print("  Refresh the instrument master: python3 fetch_instruments.py --download")
+    if not any(len(c.bars) for c in charts.values()):
+        print("  ticks arrived but no bars were built. Check the session window and")
+        print("  the instrument's tick grid against the feed's price scale.")
+        return 1
+    total_bars = sum(len(c.bars) for c in charts.values())
+    print(f"  OK: {stats.ticks} ticks, {stats.trades} trades, {total_bars} bars. "
+          f"Feed is live.")
+    if stats.protocol_errors:
+        print(f"  note: {stats.protocol_errors} protocol errors were skipped.")
     return 0
 
 

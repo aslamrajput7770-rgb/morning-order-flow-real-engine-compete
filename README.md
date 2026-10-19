@@ -265,6 +265,19 @@ python3 live_feed.py --dry-run                                   # no socket ope
 python3 live_feed.py --minutes 5 --instruments "NSE_FO:26000" --record capture.txt
 ```
 
+Before going live, download the instrument master. Live subscriptions need real
+token numbers:
+
+```bash
+python3 fetch_instruments.py              # downloads ~36 MB, then prints stats
+python3 fetch_instruments.py --show NIFTY # nearest Nifty future, with its token
+```
+
+```
+=== NIFTY ===
+  FUT  ns=NSE_FO  token=48704    NIFTY27OCT26FUT   exp=2026-10-27  tick=0.05  lot=65
+```
+
 `--record` writes every raw frame to disk, runs a sanity check on the capture,
 and reports whether the best-five bid/ask mapping is the right way round.
 Re-check any recording offline:

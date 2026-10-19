@@ -3,3 +3,11 @@ __pycache__/
 .pytest_cache/
 footprint.html
 .venv/
+
+# Instrument master: 36 MB, refreshed daily, never commit it.
+instruments.json
+OpenAPIScripMaster.json
+
+# Feed captures: market data, often large, re-take as needed.
+capture*.txt
+*.capture

@@ -105,6 +105,9 @@ class MarketCalendar:
         if self.market is Market.NSE:
             if self.segment == "NSE_EQUITY":
                 return SessionWindow("NSE", d, _at(d, 9, 15), _at(d, 15, 30), "cash")
+            if self.segment == "NSE_CURRENCY":
+                # Currency derivatives: 09:00-17:00, not the equity window.
+                return SessionWindow("NSE", d, _at(d, 9, 0), _at(d, 17, 0), "currency")
             return SessionWindow("NSE", d, _at(d, 9, 15), _at(d, 15, 40), "fno")
 
         if self.market is Market.MCX:

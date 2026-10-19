@@ -17,8 +17,28 @@ python3 demo_feed.py          # SmartStream ingestion, offline, simulated bytes
 export ANGEL_API_KEY=... ANGEL_CLIENT_CODE=... ANGEL_PIN=... ANGEL_TOTP_SECRET=...
 python3 live_feed.py --dry-run          # validate plan + session, no socket
 python3 live_feed.py --minutes 1 --record capture.txt
+python3 fetch_instruments.py             # download the 36 MB instrument master
+python3 fetch_instruments.py --show NIFTY
 python3 diagnose.py capture.txt          # verdict on a recording
 ```
+
+## Going live: real tokens are mandatory
+
+- `build_indian_token_map()` is an OFFLINE placeholder map. Its ids are not
+  real. A live subscription to them is accepted, streams nothing, and reports
+  no error. `NSE_FO:26001`, `MCX_FO:42809` and `MCX_FO:43210` do not exist in
+  the master; `NSE_FO:26000` is the NSE index, not a future.
+- Real tokens come from `instruments.json` (36 MB, gitignored, refreshed
+  daily). `live_feed.py` refuses an unknown token and exits rather than
+  subscribing into silence.
+- Match underlyings on the master's `name` field, never on the symbol prefix.
+  "NIFTY" is a prefix of "NIFTYNXT50" and "NIFTYFPI", so a prefix search for the
+  Nifty future returns a Nifty Next 50 contract. Same trap inside MCX tick
+  lookup: "SILVER" is a prefix of "SILVERMIC", so match longest prefix first.
+- Ignore the master's `tick_size` field. It is not the traded tick (10.0 for
+  RELIANCE, 10.0 for a Nifty future, real tick 0.05). Use exchange rules.
+- A run that connects but receives nothing must exit non-zero and say so.
+  `liveness_verdict` exists for exactly that; do not soften it into a warning.
 
 ## Ingestion layer (orderflow/feed/)
 

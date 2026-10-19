@@ -46,6 +46,7 @@ class SessionKind(str, Enum):
     MCX_NONAGRI = "MCX_NONAGRI"  # 09:00 - 23:30 / 23:55
     MCX_AGRI = "MCX_AGRI"  # 09:00 - 21:00
     MCX_AGRI_OTHER = "MCX_AGRI_OTHER"  # 09:00 - 17:00
+    NSE_CURRENCY = "NSE_CURRENCY"  # 09:00 - 17:00, CDS currency derivatives
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,10 @@ class Instrument:
     session: SessionKind = SessionKind.NSE_FNO
     expiry: str | None = None  # ISO date, for futures/options
     currency: str = "INR"
+    #: The underlying, from the broker master's `name` field. Symbols carry
+    #: suffixes ("NIFTY23NOV26FUT"), so symbol-prefix matching for an underlying
+    #: is wrong: "NIFTY" is a prefix of "NIFTYNXT50" and "NIFTYFPI".
+    underlying: str | None = None
 
     def __post_init__(self) -> None:
         if self.tick_size <= 0:
@@ -135,6 +140,7 @@ class TokenNamespace(str, Enum):
     BSE_FO = "BSE_FO"
     MCX_FO = "MCX_FO"
     NCDEX_FO = "NCDEX_FO"
+    CDS_FO = "CDS_FO"  # currency derivatives, 1e7 price scale
 
 
 class UnknownToken(KeyError):
