@@ -8,9 +8,26 @@ Pure-Python order-flow / footprint analytics engine. Stdlib only at runtime;
 ## Commands
 
 ```bash
-python3 -m pytest tests -q    # test suite (67 tests, no mocks)
-python3 demo.py               # end-to-end tour; writes footprint.html
+python3 -m pytest tests -q    # 127 tests, no mocks
+python3 demo.py               # engine tour; writes footprint.html
+python3 demo_indian.py        # NSE + MCX sessions, reset, token map
 ```
+
+## Indian market invariants (do not "simplify" these)
+
+- Tick sizes: NSE equity and index futures 0.05, MCX gold/silver 1.00. Prices go
+  through `orderflow.ticks.TickGrid`, which is exact integer arithmetic with
+  HALF_UP rounding. Never `round(price / tick)`.
+- NSE F&O futures close at **15:40**; cash closes at 15:30. These are different
+  calendars.
+- The MCX non-agri close is **seasonal**: 23:30 IST while US DST is in effect,
+  23:55 IST otherwise. Never hardcode it.
+- Cumulative delta and the volume profile reset at the **session open**, never at
+  midnight IST. MCX trades past 23:00.
+- Bars are numbered from the session open, not from midnight.
+- Broker tokens are keyed `(namespace, token)`. The same token number exists in
+  the NSE cash, NSE derivatives and MCX namespaces.
+- Holidays come from the caller (`MarketCalendar(holidays=...)`). Do not guess.
 
 ## Conventions
 

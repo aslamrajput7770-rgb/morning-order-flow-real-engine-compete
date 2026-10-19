@@ -32,6 +32,7 @@ from orderflow import (
     naked_pocs,
     order_flow_vwap,
     ansi_footprint,
+    OffGridTick,
 )
 
 TICK = 0.25
@@ -52,8 +53,22 @@ def bar_of(grid, trades):
 class TestTickGrid:
     def test_round_trip_snaps_to_tick(self):
         g = TickGrid(0.25)
-        assert g.to_price(g.to_index(100.10)) == 100.0
-        assert g.to_price(g.to_index(100.13)) == 100.25
+        assert g.to_price(g.to_index(100.0)) == 100.0
+        assert g.to_price(g.to_index(100.25)) == 100.25
+
+    def test_off_grid_price_is_clamped_and_counted(self):
+        """One stray print must not kill the engine; it must be visible."""
+        g = TickGrid(0.25)
+        assert g.snap(100.10) == 100.0
+        assert g.off_grid_count == 1
+
+    def test_off_grid_flood_raises(self):
+        """A flood means the tick size is wrong, so fail loudly."""
+        g = TickGrid(0.25, max_off_grid=3)
+        for _ in range(3):
+            g.snap(100.10)
+        with pytest.raises(OffGridTick):
+            g.snap(100.10)
 
     def test_float_keys_do_not_collide(self):
         """0.1 + 0.2 must land on the same index as 0.3 at tick 0.1."""
@@ -722,7 +737,7 @@ class TestIntegration:
 
     def test_round_trip_price_grid_stability(self, grid):
         """Snapping a price twice must be idempotent, or levels fragment."""
-        for p in (99.75, 100.0, 100.123, 100.249, 100.251):
+        for p in (99.75, 100.0, 100.25, 100.50):
             once = grid.to_price(grid.to_index(p))
             twice = grid.to_price(grid.to_index(once))
             assert once == twice

@@ -109,6 +109,7 @@ These are the decisions that separate a working engine from a plausible one:
 ```
 orderflow/
   core.py        Trade, Side, TickGrid, PriceLevel, ValueArea, Imbalance, Divergence
+  ticks.py       exact integer tick arithmetic (1e-8 base unit, HALF_UP)
   footprint.py   FootprintBar, FootprintChart  (bid/ask, delta, POC, imbalances)
   profile.py     Profile, ProfileBuilder, naked_pocs
   delta.py       cumulative delta, delta profile, divergence
@@ -116,14 +117,107 @@ orderflow/
   dom.py         BookSnapshot, LiquidityMap, absorption, SuperDOM
   indicators.py  order-flow VWAP, pressure, market analyzer
   render.py      heatmap colouring, ANSI and HTML output
+  instruments.py Instrument, Exchange, TokenMapper  (Indian contracts)
+  session.py     IST calendars: NSE cash/F&O, MCX (seasonal close)
+  session_chart.py  SessionChart: daily reset of delta and profile
 tests/
-  test_engine.py 67 tests, real code paths, no mocks
+  test_engine.py        69 tests, engine behaviour
+  test_indian_market.py 58 tests, tick sizes, sessions, tokens, reset
 demo.py          end-to-end tour on seeded synthetic tape
+demo_indian.py   NSE + MCX sessions, reset, token map, tick-grid book lookup
 ```
+
+## Indian market
+
+The engine is instrument-agnostic; the Indian market specifics live in three
+modules.
+
+### Tick sizes are exact, not approximate
+
+`orderflow/ticks.py` represents prices as integer counts of a 1e-8 base unit and
+does the grid arithmetic with exact integers and explicit HALF_UP rounding.
+
+| Instrument | Tick | Grid |
+|---|---|---|
+| NSE equity / index futures (NIFTY, BANKNIFTY) | 0.05 | `TickGrid(0.05)` |
+| MCX gold / silver futures | 1.00 | `TickGrid(1.00)` |
+
+Why the obvious implementation is wrong:
+
+```python
+round(100.025 * 20) / 20   # -> 100.0    banker's rounding, not HALF_UP
+round(100.075 * 20) / 20   # -> 100.10   the snap is not even monotonic
+```
+
+A non-monotonic or drifting snap puts volume on the wrong price level, and the
+diagonal imbalance comparison (`Bid[P]` vs `Ask[P + one tick]`) then compares the
+wrong two levels. Every downstream signal inherits the error.
+
+Off-grid prints are handled as a trade-off, not a toggle:
+
+- a handful of strays (feed noise) are clamped and counted in `off_grid_count`
+- a flood means the tick size is wrong for the instrument, so it raises
+  `OffGridTick` rather than silently producing wrong numbers forever
+
+### Sessions are the exchange's, not midnight's
+
+`orderflow/session.py` defines the calendars in IST:
+
+| Market | Open | Close |
+|---|---|---|
+| NSE cash (equity) | 09:15 | 15:30 |
+| NSE F&O (futures) | 09:15 | **15:40** |
+| MCX non-agri (bullion, metals, energy) | 09:00 | **23:30** US DST on / **23:55** off |
+
+Two traps worth stating plainly:
+
+1. F&O futures close at **15:40**, not the 15:30 cash close. Using one close
+   time for both drops the last ten minutes of the futures session, which is the
+   settlement window.
+2. The MCX close is **seasonal**, driven by US daylight saving, not by Indian
+   time. Hardcoding either 23:30 or 23:55 is wrong for half the year. The
+   calendar computes US DST from the tz database.
+
+Bars are numbered from the session open, not from midnight. A midnight-based bar
+counter misaligns the first NSE bar by 111 bars at a 5-minute interval.
+
+### The daily reset
+
+`orderflow/session_chart.py` (`SessionChart`) resets cumulative delta and the
+volume profile at each session open. Reset is keyed to the session boundary, not
+to 00:00 IST, because MCX trades until 23:30/23:55 and a midnight reset would
+wipe the live evening session's own data. Trades outside any session (pre-open,
+post-close, holiday) are counted in `off_session_trades` and dropped rather than
+folded into the next session.
+
+### Token mapping
+
+`orderflow/instruments.py` (`TokenMapper`) maps broker token ids to instruments,
+keyed on `(namespace, token)`. Indian brokers stream ticks by numeric token, and
+the same token number exists in separate namespaces for the NSE cash market, NSE
+derivatives and MCX. A bare-token lookup collides across segments and delivers
+Nifty futures ticks labelled as some equity, with every number wrong and nothing
+raising. The API deliberately offers no bare-token lookup.
+
+### Indian demo
+
+```bash
+python3 demo_indian.py
+```
+
+Runs two NSE Nifty sessions and two MCX gold sessions, shows the reset firing,
+prints the seasonal MCX close, and demonstrates the float-equality trap in book
+lookup.
 
 ## Not included
 
-- Live data adapters (broker/exchange specific)
+- Live data adapters (broker/exchange specific). The `TokenMapper` is the seam:
+  your Angel One / Kite / Fyers adapter resolves tokens to `Instrument`s and
+  emits `Trade`s. Real deployments load the token numbers from the broker's
+  instrument master file at startup; `build_indian_token_map()` is a working
+  stand-in with placeholder ids.
 - Order routing (SuperDOM models ladder state and fills; sending orders is the
   adapter's job)
 - Historical data storage
+- The exchange holiday list. `MarketCalendar(holidays=...)` takes it from the
+  caller; a guessed holiday is a silently missing day of profile data.

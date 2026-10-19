@@ -1,14 +1,18 @@
 """Core data contracts for the order-flow engine.
 
-Prices are snapped onto an integer tick grid before aggregation. Floats are
-never used as dictionary keys here: 0.1 + 0.2 != 0.3, and a footprint that
+Prices are snapped onto an exact integer tick grid before aggregation. Floats
+are never used as dictionary keys here: 0.1 + 0.2 != 0.3, and a footprint that
 silently merges two adjacent price levels is worse than no footprint at all.
+
+`TickGrid` lives in `orderflow.ticks` and is re-exported here for convenience.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+
+from .ticks import OffGridTick, TickGrid
 
 
 class Side(str, Enum):
@@ -33,27 +37,6 @@ class Trade:
             raise ValueError(f"trade size must be > 0, got {self.size}")
         if self.price <= 0:
             raise ValueError(f"trade price must be > 0, got {self.price}")
-
-
-class TickGrid:
-    """Maps float prices onto a discrete integer index at a fixed tick size."""
-
-    __slots__ = ("tick_size", "_scale")
-
-    def __init__(self, tick_size: float) -> None:
-        if tick_size <= 0:
-            raise ValueError("tick_size must be > 0")
-        self.tick_size = float(tick_size)
-        self._scale = 1.0 / self.tick_size
-
-    def to_index(self, price: float) -> int:
-        return int(round(price * self._scale))
-
-    def to_price(self, index: int) -> float:
-        return index / self._scale
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"TickGrid(tick_size={self.tick_size})"
 
 
 @dataclass(slots=True)

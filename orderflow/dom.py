@@ -47,11 +47,28 @@ class BookSnapshot:
             return None
         return (self.best_bid + self.best_ask) / 2.0
 
-    def bid_size(self, price: float) -> float:
-        return next((s for p, s in self.bids if p == price), 0.0)
+    def bid_size(self, price: float, grid=None) -> float:
+        """Resting bid size at `price`.
 
-    def ask_size(self, price: float) -> float:
-        return next((s for p, s in self.asks if p == price), 0.0)
+        With `grid`, prices are compared on the tick grid rather than with float
+        equality. Plain `==` silently returns 0.0 for a feed price of
+        100.05000000000001 against a query of 100.05, which reads as "no
+        liquidity" and poisons every absorption signal.
+        """
+        return self._size_at(self.bids, price, grid)
+
+    def ask_size(self, price: float, grid=None) -> float:
+        return self._size_at(self.asks, price, grid)
+
+    @staticmethod
+    def _size_at(levels, price: float, grid) -> float:
+        if grid is None:
+            return next((s for p, s in levels if p == price), 0.0)
+        want = grid.to_index(price)
+        for p, s in levels:
+            if grid.to_index(p) == want:
+                return s
+        return 0.0
 
 
 @dataclass(slots=True)
@@ -98,8 +115,10 @@ class Absorption:
 
     @property
     def detail(self) -> str:
+        # Format with enough precision to show a 0.05 tick: %g would round
+        # 24000.05 to 24000 and hide the level the absorption happened at.
         return (
-            f"{self.absorbed_side} absorbed {self.volume:g} @ {self.price:g} "
+            f"{self.absorbed_side} absorbed {self.volume:g} @ {self.price:.4f} "
             f"over {self.range_ticks:g} ticks"
         )
 
