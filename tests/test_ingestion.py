@@ -764,3 +764,165 @@ class TestTOTP:
 
         with pytest.raises(ValueError, match="base32"):
             totp("not!valid!base32!!", at_time=59)
+
+
+# ============================================================ diagnostics
+def _sane_spec(seq=1, ltp=24000.05, vol=1000, bid=23999.95, ask=24000.10):
+    from orderflow.feed import TickSpec
+
+    return TickSpec(
+        mode=SubscriptionMode.SNAP_QUOTE,
+        exchange_type=ExchangeType.NSE_FO,
+        token="26000",
+        sequence_number=seq,
+        exchange_timestamp_ms=1_700_000_000_000 + seq * 1000,
+        last_traded_price=ltp,
+        volume_trade_for_the_day=vol,
+        bids=((bid, 100),),
+        asks=((ask, 100),),
+    )
+
+
+def _invert_best_five_flags(packet: bytes) -> bytes:
+    """Flip the bid/ask flag on every best-five entry.
+
+    This is exactly what a wrong mapping looks like on the wire: the low prices
+    carry the ask flag and the high prices carry the bid flag, so a decoder that
+    trusts the flag reads a crossed book.
+    """
+    buf = bytearray(packet)
+    import struct as _s
+
+    for i in range(10):
+        o = 147 + i * 20
+        flag = _s.unpack_from("<H", buf, o)[0]
+        _s.pack_into("<H", buf, o, 0 if flag else 1)
+    return bytes(buf)
+
+
+class TestCaptureDiagnostics:
+    def test_sane_capture_reads_ok(self):
+        from orderflow.feed import scan_frames, report
+
+        frames = [encode_tick(_sane_spec(seq=i, vol=1000 + i * 10)) for i in range(50)]
+        diag = scan_frames(frames)
+        assert diag.verdict() == "OK", report(diag)
+        assert diag.crossed_books == 0
+        assert diag.ticks_with_book == 50
+
+    def test_inverted_mapping_is_detected(self):
+        """The whole point of the tool: an inverted flag mapping must be caught.
+
+        If this ever stops failing, the diagnostic is worthless and delta could
+        silently be built upside down.
+        """
+        from orderflow.feed import scan_frames, report
+
+        frames = [_invert_best_five_flags(encode_tick(_sane_spec(seq=i)))
+                  for i in range(50)]
+        diag = scan_frames(frames)
+        assert diag.verdict() == "INVERTED", report(diag)
+        assert diag.crossed_books == 50
+        assert diag.crossed_fraction == 1.0
+
+    def test_no_book_capture_reads_no_book(self):
+        from orderflow.feed import TickSpec, scan_frames
+
+        spec = TickSpec(
+            mode=SubscriptionMode.LTP,
+            exchange_type=ExchangeType.NSE_FO,
+            token="26000",
+            sequence_number=1,
+            exchange_timestamp_ms=1_700_000_000_000,
+            last_traded_price=24000.05,
+        )
+        diag = scan_frames([encode_tick(spec)])
+        assert diag.verdict() == "NO_BOOK"
+
+    def test_few_packets_is_insufficient_not_ok(self):
+        from orderflow.feed import scan_frames
+
+        diag = scan_frames([encode_tick(_sane_spec(seq=1))])
+        assert diag.verdict() == "INSUFFICIENT"
+
+    def test_scaled_price_without_division_is_flagged(self):
+        """A price that was never divided by the scale must be caught.
+
+        24000.05 arrives on the wire as 2400005. If the decoder forgets to
+        divide, every price is 100x too high. A modulo test cannot catch this:
+        2400005 % 100 == 5, because the raw value only has to be a multiple of
+        the tick size, not of the scale. Only a ceiling catches it.
+        """
+        from orderflow.feed import scan_frames
+
+        raw = bytearray(encode_tick(_sane_spec(seq=1)))
+        import struct as _s
+
+        # A decoder that never divides leaves the price at 2400005, which is
+        # 100x the real 24000.05. In raw terms that is 2400005 * 100.
+        _s.pack_into("<q", raw, 43, 2400005 * 100)
+        diag = scan_frames([bytes(raw)])
+        assert diag.price_above_ceiling == 1
+
+    def test_normal_scaled_price_is_not_flagged(self):
+        """The check must stay silent on a correct capture.
+
+        A diagnostic that fires on every packet gets ignored, and an ignored
+        diagnostic is worse than none.
+        """
+        from orderflow.feed import scan_frames
+
+        frames = [encode_tick(_sane_spec(seq=i, vol=1000 + i)) for i in range(30)]
+        diag = scan_frames(frames)
+        assert diag.price_above_ceiling == 0
+        assert diag.price_implausible == 0
+
+    def test_volume_regression_and_flat_are_counted(self):
+        from orderflow.feed import scan_frames
+
+        frames = [
+            encode_tick(_sane_spec(seq=1, vol=1000)),
+            encode_tick(_sane_spec(seq=2, vol=1000)),
+            encode_tick(_sane_spec(seq=3, vol=500)),
+        ]
+        diag = scan_frames(frames)
+        assert diag.volume_unchanged == 1
+        assert diag.volume_regressions == 1
+
+    def test_sides_are_attributed_not_guessed(self):
+        from orderflow.feed import scan_frames
+
+        frames = [
+            encode_tick(_sane_spec(seq=1, ltp=24000.10, vol=1000)),
+            encode_tick(_sane_spec(seq=2, ltp=23999.95, vol=1100)),
+        ]
+        diag = scan_frames(frames)
+        assert diag.trades == 2
+        assert diag.sides[SideSource.QUOTE_RULE] + diag.sides[SideSource.BOTH] == 2
+
+    def test_heartbeats_do_not_count_as_packets(self):
+        from orderflow.feed import scan_frames
+
+        diag = scan_frames(["ping", encode_tick(_sane_spec(seq=1)), "ping"])
+        assert diag.packets == 1
+        assert diag.decode_errors == 0
+
+    def test_roundtrip_through_a_recorded_file(self, tmp_path):
+        from orderflow.feed import scan_capture
+        from orderflow.feed.transports import record_frames
+
+        frames = [encode_tick(_sane_spec(seq=i, vol=1000 + i * 10)) for i in range(30)]
+        p = tmp_path / "cap.txt"
+        record_frames(frames, p)
+        diag = scan_capture(p)
+        assert diag.verdict() == "OK"
+        assert diag.packets == 30
+
+    def test_unknown_side_warning_appears_when_high(self):
+        from orderflow.feed import Diagnostics, report
+
+        d = Diagnostics(packets=100, trades=100)
+        d.sides[SideSource.UNKNOWN] = 60
+        d.ticks_with_book = 100
+        txt = report(d)
+        assert "unknown side" in txt.lower()

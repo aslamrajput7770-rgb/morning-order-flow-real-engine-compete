@@ -17,6 +17,7 @@ python3 demo_feed.py          # SmartStream ingestion, offline, simulated bytes
 export ANGEL_API_KEY=... ANGEL_CLIENT_CODE=... ANGEL_PIN=... ANGEL_TOTP_SECRET=...
 python3 live_feed.py --dry-run          # validate plan + session, no socket
 python3 live_feed.py --minutes 1 --record capture.txt
+python3 diagnose.py capture.txt          # verdict on a recording
 ```
 
 ## Ingestion layer (orderflow/feed/)
@@ -61,8 +62,17 @@ requires it.
   subscriptions is silent, which looks exactly like a dead market.
 - Heartbeats are non-binary (the literal `ping`). Skip them; never parse them.
 - The official SDK maps its parsed buy list to a key named `best_5_sell_data`
-  and vice versa. `_parse_best_five` maps bid -> bid; validate against a live
-  packet dump before trusting the direction in production.
+  and vice versa. `_parse_best_five` maps bid -> bid. Do not settle this by
+  reading hex: `diagnose.py` decides it from the capture, because a real book
+  always satisfies best_bid < best_ask and an inverted mapping reads as crossed
+  on ~every packet. `live_feed.py --record` runs the same check automatically.
+  An inverted book does NOT look broken downstream: the quote rule still fires
+  on every print and returns a confident, wrong side. It is the quietest way to
+  invert delta.
+- A price-scale check must use a ceiling, not a modulo. 24000.05 * 100 = 2400005,
+  and 2400005 % 100 == 5. The raw value only divides evenly by the TICK SIZE,
+  never necessarily by the scale, so `raw % scale != 0` fires on every good
+  packet and trains the reader to ignore the diagnostic.
 - `Transport.is_live` decides what `recv() is None` means. On a replay it means
   exhausted and ends the loop; on a live socket it means idle and the loop keeps
   waiting. Treating them the same kills a live feed on the first quiet minute.

@@ -61,6 +61,17 @@ from .tick_reader import (
 from .simulator import TickSpec, encode_stream, encode_tick
 from .transports import FileTransport, WebSocketTransport, record_frames
 from .totp import totp
+from .diagnostics import (
+    Diagnostics,
+    VERDICT_INSUFFICIENT,
+    VERDICT_INVERTED,
+    VERDICT_NO_BOOK,
+    VERDICT_OK,
+    report,
+    scan_capture,
+    scan_frames,
+    scan_ticks,
+)
 from ..instruments import TokenNamespace
 
 __all__ = [
@@ -110,4 +121,14 @@ __all__ = [
     "record_frames",
     # auth helper
     "totp",
+    # capture diagnostics
+    "Diagnostics",
+    "scan_capture",
+    "scan_frames",
+    "scan_ticks",
+    "report",
+    "VERDICT_OK",
+    "VERDICT_INVERTED",
+    "VERDICT_NO_BOOK",
+    "VERDICT_INSUFFICIENT",
 ]

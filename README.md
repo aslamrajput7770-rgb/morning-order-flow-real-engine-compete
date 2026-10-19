@@ -265,8 +265,26 @@ python3 live_feed.py --dry-run                                   # no socket ope
 python3 live_feed.py --minutes 5 --instruments "NSE_FO:26000" --record capture.txt
 ```
 
-`--record` writes every raw frame to disk; replay it offline with
-`FileTransport` as a permanent regression fixture.
+`--record` writes every raw frame to disk, runs a sanity check on the capture,
+and reports whether the best-five bid/ask mapping is the right way round.
+Re-check any recording offline:
+
+```bash
+python3 diagnose.py capture.txt
+```
+
+```
+packets with a book  : 60
+crossed books        : 0 (0.0%)
+VERDICT: OK - book is sane, bid/ask mapping is correct
+```
+
+The check exists because an inverted book is invisible: the quote rule still
+fires on every print and returns a confident, wrong side, so delta comes out
+upside down while the footprint looks perfect. A real book always has
+best_bid < best_ask; an inverted mapping reads as crossed on nearly every
+packet. That settles it with no reference data. The recording also replays
+offline through `FileTransport` as a permanent regression fixture.
 
 Or swap the transport yourself (`pip install websocket-client`):
 

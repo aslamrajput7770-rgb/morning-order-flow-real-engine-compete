@@ -236,7 +236,21 @@ def main(argv=None) -> int:
     if args.record and frames_seen:
         path = record_frames(frames_seen, args.record)
         print(f"\nrecorded {len(frames_seen)} frames to {path}")
-        print("  -> keep this as a regression fixture; it replays offline with FileTransport")
+
+        # Settle the one question the docs cannot answer: is the best-five
+        # bid/ask flag the right way round? Run the check on the capture just
+        # taken, so an inverted book is caught now rather than in production.
+        from orderflow.feed import VERDICT_INVERTED, report, scan_capture
+
+        diag = scan_capture(path)
+        print()
+        print(report(diag))
+        if diag.verdict() == VERDICT_INVERTED:
+            print(
+                "\nACTION REQUIRED: the book is crossed, so the best-five flag mapping\n"
+                "is inverted. Delta built on it is upside down. Swap the bid/ask branch\n"
+                "in orderflow/feed/protocol.py::_parse_best_five and re-run."
+            )
 
     print("\nReminder: SmartStream has no aggressor flag. Sides are inferred "
           "(quote rule, then tick rule). Watch the UNKNOWN share before trusting delta.")
