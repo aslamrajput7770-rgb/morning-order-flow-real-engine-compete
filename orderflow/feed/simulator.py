@@ -71,11 +71,17 @@ def _token_bytes(token: str) -> bytes:
 
 
 def _best_five_block(spec: TickSpec) -> bytes:
-    """10 levels x 20 bytes at offset 147: flag H, qty q, price q, orders H."""
+    """10 levels x 20 bytes at offset 147: flag H, qty q, price q, orders H.
+
+    flag 0 marks an ASK and flag 1 marks a BID, which is inverted from the
+    naming. Settled on a live NIFTY packet: the flag==0 levels sat above the
+    flag==1 levels, and a bid is always below an ask. The decoder and the
+    official SDK both read it this way.
+    """
     block = bytearray()
-    for price, qty in spec.bids:
-        block += struct.pack(_LE + "HqqH", 0, qty, _scale(price, spec.scale), 1)
     for price, qty in spec.asks:
+        block += struct.pack(_LE + "HqqH", 0, qty, _scale(price, spec.scale), 1)
+    for price, qty in spec.bids:
         block += struct.pack(_LE + "HqqH", 1, qty, _scale(price, spec.scale), 1)
     block += b"\x00" * (200 - len(block))
     return bytes(block)

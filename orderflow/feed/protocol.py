@@ -245,23 +245,38 @@ def decode_packet(data: bytes) -> RawTick:
 def _parse_best_five(data: bytes) -> tuple[tuple[DepthLevel, ...], tuple[DepthLevel, ...]]:
     """Parse the 10 x 20-byte best-five block at offset 147.
 
-    The level flag is 0 for a bid and non-zero for an ask. Note that the
-    official `smartapi-python` SDK assigns the parsed buy list to a key named
-    `best_5_sell_data` and vice versa, which looks like an upstream copy/paste
-    bug. This decoder maps bid -> bid. Validate against a live packet dump
-    before trusting it in production.
+    The level flag is 0 for an ASK and 1 for a BID. That is the opposite of
+    what the field name suggests, and it was settled on a live NIFTY packet,
+    not from documentation. In that packet the flag==0 levels ran
+    22904.8 -> 22907.0 and the flag==1 levels ran 22893.1 -> 22892.0. A bid is
+    always below an ask, so the only uncrossed reading is flag==0 = ask.
+
+    This is why the official `smartapi-python` SDK looks like it swaps the two
+    lists: `_parse_best_5_buy_and_sell_data` files flag==0 under
+    `best_5_buy_data`, then `_parse_binary_data` assigns `best_5_buy_data` from
+    `best_5_sell_data` and vice versa. The swap is deliberate, not a copy/paste
+    error, and the SDK ends up correct.
+
+    Getting this wrong inverts every inferred trade side, because the quote
+    rule compares each print against the best bid and the best ask.
     """
     bids: list[DepthLevel] = []
     asks: list[DepthLevel] = []
     for i in range(10):
         o = 147 + i * 20
         flag = _unpack("H", data, o)
+        price_raw = _unpack("q", data, o + 10)
+        # The block is fixed at 10 levels and padded with zeros when the book
+        # is short. A price of zero is not a real level, and keeping it sets
+        # best_ask to 0, which makes every print look like a buy at the ask.
+        if price_raw <= 0:
+            continue
         level = DepthLevel(
-            price_raw=_unpack("q", data, o + 10),
+            price_raw=price_raw,
             quantity=_unpack("q", data, o + 2),
             orders=_unpack("H", data, o + 18),
         )
-        (bids if flag == 0 else asks).append(level)
+        (asks if flag == 0 else bids).append(level)
     return tuple(bids), tuple(asks)
 
 

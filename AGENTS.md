@@ -40,8 +40,19 @@ Verified against the official client, `SmartApi/smartWebSocketV2.py` in
   PONG and leaves a dead socket looking alive. websocket-client answers the
   server's PONG inside `recv_data_frame`, so no manual PONG handling.
 
-`tests/test_protocol_conformance.py` and `tests/test_wire_path.py` pin all
-three. If a live run connects and delivers nothing, check these first.
+- In the best-five block at offset 147, **flag 0 is an ASK and flag 1 is a
+  BID**. This is inverted from the naming and it was settled on a live NIFTY
+  packet: the flag==0 levels ran 22904.8 -> 22907.0 and the flag==1 levels ran
+  22893.1 -> 22892.0, and a bid is always below an ask. The official SDK looks
+  like it swaps the two lists, but the swap is deliberate and it ends up
+  correct. Reading the flag the intuitive way crosses the book, and then the
+  quote rule inverts every inferred trade side.
+
+`tests/test_protocol_conformance.py` and `tests/test_wire_path.py` pin the
+first three. `tests/test_live_packet.py` pins the flag convention against a
+real captured frame, because the encoder and decoder agreed with each other
+while both were wrong, so no round-trip test could catch it. If a live run
+connects and delivers nothing, or if delta looks inverted, check these first.
 
 ## Going live: real tokens are mandatory
 
