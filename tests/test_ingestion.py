@@ -650,14 +650,18 @@ class _FakeTransport:
         self._clock = clock
         self.i = 0
         self.sent = []
+        self.heartbeats = 0
         self.closed = False
         self.connected = False
 
     def connect(self):
         self.connected = True
 
-    def send(self, data):
-        self.sent.append(data)
+    def send(self, data, binary=False):
+        self.sent.append(data if isinstance(data, bytes) else data.encode("utf-8"))
+
+    def heartbeat(self):
+        self.heartbeats += 1
 
     def recv(self, timeout=None):
         if self._clock is not None:
@@ -706,7 +710,15 @@ class TestLiveTransportSemantics:
         stats = self._conn(t).run(on_trade=lambda rt: None, clock=lambda: clock[0])
         assert stats.reconnects == 0
 
-    def test_live_heartbeat_sent_while_idle(self):
+    def test_live_heartbeat_uses_a_control_frame_while_idle(self):
+        """The heartbeat is a protocol-level PING, not a text "ping".
+
+        The official SDK gets its heartbeat from
+        `run_forever(ping_interval=10)`, which sends a PING control frame. A
+        text message containing the word "ping" is not a heartbeat: it draws no
+        PONG and leaves a dead socket looking alive. This asserts the frame
+        went out on the control channel, and that no text "ping" was sent.
+        """
         clock = [0.0]
         t = _FakeTransport([None] * 20, is_live=True, clock=clock)
         conn = SmartStreamConnector(
@@ -716,7 +728,9 @@ class TestLiveTransportSemantics:
             heartbeat_interval=10.0,
         )
         conn.run(on_trade=lambda rt: None, max_seconds=30, clock=lambda: clock[0])
-        assert any(b"ping" in s for s in t.sent)
+        assert t.heartbeats > 0, "no protocol PING was sent"
+        assert not any(s.strip() == b"ping" for s in t.sent), \
+            "a text \"ping\" was sent; that is not a heartbeat"
 
     def test_max_seconds_bounds_a_live_run(self):
         clock = [0.0]

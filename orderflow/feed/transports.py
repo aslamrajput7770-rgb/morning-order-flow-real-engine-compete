@@ -18,6 +18,19 @@ from typing import Iterable
 
 from .connector import HEARTBEAT_MESSAGE, ROOT_URI, Transport
 
+#: Lazily imported so that importing this module never requires websocket-client.
+_ABNF = None
+
+
+def _abnf():
+    """The websocket-client ABNF opcode table, imported on first use."""
+    global _ABNF
+    if _ABNF is None:
+        from websocket import ABNF  # type: ignore
+
+        _ABNF = ABNF
+    return _ABNF
+
 
 class WebSocketTransport:
     """A real SmartStream socket, using `websocket-client` if present.
@@ -51,6 +64,22 @@ class WebSocketTransport:
         self._ws = None
         self._lock = threading.Lock()
 
+    def auth_headers(self) -> dict:
+        """The handshake headers, as the official SDK sends them.
+
+        The JWT goes in bare. The official SDK sets
+        `"Authorization": self.auth_token` with no scheme prefix, and the word
+        "Bearer" appears nowhere in its WebSocket module. The REST login
+        endpoint does use "Bearer", which is what makes this easy to get wrong
+        by pattern-matching the two.
+        """
+        return {
+            "Authorization": self.auth_token,
+            "x-api-key": self.api_key,
+            "x-client-code": self.client_code,
+            "x-feed-token": self.feed_token,
+        }
+
     def connect(self) -> None:
         try:
             import websocket  # type: ignore
@@ -60,12 +89,7 @@ class WebSocketTransport:
                 "pip install websocket-client"
             ) from exc
 
-        headers = {
-            "Authorization": f"Bearer {self.auth_token}",
-            "x-api-key": self.api_key,
-            "x-client-code": self.client_code,
-            "x-feed-token": self.feed_token,
-        }
+        headers = self.auth_headers()
         self._ws = websocket.create_connection(
             self.uri,
             header=[f"{k}: {v}" for k, v in headers.items()],
@@ -73,11 +97,33 @@ class WebSocketTransport:
             timeout=self.timeout,
         )
 
-    def send(self, data: bytes) -> None:
+    def send(self, data: bytes | str, binary: bool = False) -> None:
+        """Send a frame. Subscription JSON is TEXT; the server expects that.
+
+        websocket-client's `send` defaults to `opcode=OPCODE_TEXT`, and it only
+        emits a binary frame if asked. The official SDK sends
+        `json.dumps(request_data)`, so a str: an OPCODE_TEXT frame. Passing
+        bytes here would silently produce OPCODE_BINARY instead, and the server
+        would not read it as a subscription.
+        """
         if self._ws is None:
             raise RuntimeError("transport is not connected")
         with self._lock:
-            self._ws.send(data)
+            abnf = _abnf()
+            opcode = abnf.OPCODE_BINARY if binary else abnf.OPCODE_TEXT
+            self._ws.send(data, opcode=opcode)
+
+    def heartbeat(self) -> None:
+        """A protocol-level PING frame.
+
+        websocket-client answers the server's PONG inside `recv_data_frame`, so
+        no manual PONG handling is needed here. This mirrors
+        `run_forever(ping_interval=10)` in the official SDK.
+        """
+        if self._ws is None:
+            raise RuntimeError("transport is not connected")
+        with self._lock:
+            self._ws.ping()
 
     def recv(self, timeout: float | None = None) -> bytes | None:
         if self._ws is None:
@@ -113,6 +159,7 @@ class FileTransport:
         self._frames: list[bytes | str] = []
         self._i = 0
         self.sent: list[bytes] = []
+        self.heartbeats = 0
 
     def connect(self) -> None:
         self._frames = []
@@ -126,8 +173,12 @@ class FileTransport:
                 self._frames.append(line[4:])
         self._i = 0
 
-    def send(self, data: bytes) -> None:
-        self.sent.append(data)
+    def send(self, data: bytes | str, binary: bool = False) -> None:
+        self.sent.append(data if isinstance(data, bytes) else data.encode("utf-8"))
+
+    def heartbeat(self) -> None:
+        """No control channel in a recording; count it so tests can assert."""
+        self.heartbeats += 1
 
     def recv(self, timeout: float | None = None):
         if self._i >= len(self._frames):

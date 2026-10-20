@@ -36,6 +36,7 @@ from .connector import (
     Transport,
     build_plan,
     subscribe_message,
+    subscribe_message_text,
 )
 from .protocol import (
     DEFAULT_PRICE_SCALE,
@@ -103,6 +104,7 @@ __all__ = [
     "Subscription",
     "build_plan",
     "subscribe_message",
+    "subscribe_message_text",
     "TickRouter",
     "RoutedTrade",
     "Transport",

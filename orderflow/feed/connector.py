@@ -162,6 +162,19 @@ def subscribe_message(
     return json.dumps(payload).encode("utf-8")
 
 
+def subscribe_message_text(action: int, subscriptions: Iterable[Subscription],
+                           correlation_id: str = "of1") -> str:
+    """The subscribe frame as text, which is what the wire carries.
+
+    The official SDK sends `json.dumps(request_data)`, a str, so
+    websocket-client emits an OPCODE_TEXT frame. It does NOT send a binary
+    frame, and it does NOT prefix the JSON with any length header. Sending the
+    same JSON as bytes produces an OPCODE_BINARY frame instead, which the
+    server does not parse as a subscription.
+    """
+    return subscribe_message(action, subscriptions, correlation_id).decode("utf-8")
+
+
 # --------------------------------------------------------------------------
 # Transport
 # --------------------------------------------------------------------------
@@ -176,7 +189,11 @@ class Transport(Protocol):
 
     def connect(self) -> None: ...
 
-    def send(self, data: bytes) -> None: ...
+    def send(self, data: bytes | str, binary: bool = False) -> None: ...
+
+    def heartbeat(self) -> None:
+        """Send a heartbeat. A no-op on transports without a control channel."""
+        ...
 
     def recv(self, timeout: float | None = None) -> bytes | None: ...
 
@@ -197,14 +214,19 @@ class ReplayTransport:
         self._frames = list(frames)
         self._i = 0
         self.sent: list[bytes] = []
+        self.heartbeats = 0
         self.connected = False
         self.closed = False
 
     def connect(self) -> None:
         self.connected = True
 
-    def send(self, data: bytes) -> None:
-        self.sent.append(data)
+    def send(self, data: bytes | str, binary: bool = False) -> None:
+        self.sent.append(data if isinstance(data, bytes) else data.encode("utf-8"))
+
+    def heartbeat(self) -> None:
+        """A replay has no control channel; record it so tests can assert on it."""
+        self.heartbeats += 1
 
     def recv(self, timeout: float | None = None):
         if self._i >= len(self._frames):
@@ -329,7 +351,8 @@ class SmartStreamConnector:
         session = self.plan.sessions[index]
         if not session:
             return
-        transport.send(subscribe_message(1, session, correlation_id=f"of{index}"))
+        # TEXT frame, matching the official SDK's `wsapp.send(json.dumps(...))`.
+        transport.send(subscribe_message_text(1, session, correlation_id=f"of{index}"))
 
     def run(
         self,
@@ -457,10 +480,18 @@ class SmartStreamConnector:
         transport: Transport,
         clock: Callable[[], float] = time.monotonic,
     ) -> bool:
-        """Send `ping` if the interval elapsed. Returns True when sent."""
+        """Send a heartbeat if the interval elapsed. Returns True when sent.
+
+        This sends a WebSocket protocol-level PING frame, not a text message
+        containing the word "ping". The official SDK relies on
+        `run_forever(ping_interval=10)`, which is exactly that: websocket-client
+        sends a PING control frame and the server answers with PONG. A text
+        "ping" is not a heartbeat, gets no reply, and lets a dead socket look
+        alive while the feed is silent.
+        """
         now = clock()
         if now - self._last_heartbeat >= self.heartbeat_interval:
-            transport.send(HEARTBEAT_MESSAGE.encode("utf-8"))
+            transport.heartbeat()
             self._last_heartbeat = now
             return True
         return False
