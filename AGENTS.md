@@ -22,6 +22,27 @@ python3 fetch_instruments.py --show NIFTY
 python3 diagnose.py capture.txt          # verdict on a recording
 ```
 
+## Wire protocol: three silent-failure bugs, already fixed
+
+Verified against the official client, `SmartApi/smartWebSocketV2.py` in
+`angel-one/smartapi-python`. Do not "fix" these back:
+
+- `Authorization` is the BARE JWT. The official SDK sets
+  `"Authorization": self.auth_token`; the string "Bearer" appears nowhere in
+  its WebSocket module. The REST login does use "Bearer" -- do not copy that
+  habit into the socket handshake.
+- The subscribe frame is TEXT. The SDK sends `json.dumps(request_data)`, a str.
+  websocket-client keys the opcode off the argument type, so passing bytes
+  silently produces OPCODE_BINARY, which the server does not read as a
+  subscription. `Transport.send(data, binary=False)` defaults to TEXT.
+- The heartbeat is a protocol PING frame (`ws.ping()`), not a text "ping". The
+  SDK gets it from `run_forever(ping_interval=10)`. A text "ping" draws no
+  PONG and leaves a dead socket looking alive. websocket-client answers the
+  server's PONG inside `recv_data_frame`, so no manual PONG handling.
+
+`tests/test_protocol_conformance.py` and `tests/test_wire_path.py` pin all
+three. If a live run connects and delivers nothing, check these first.
+
 ## Going live: real tokens are mandatory
 
 - `build_indian_token_map()` is an OFFLINE placeholder map. Its ids are not
