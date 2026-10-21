@@ -87,8 +87,13 @@ class TestRehearsal:
         assert shards, "the rehearsal recorded nothing"
 
     def test_rehearsal_frames_land_inside_the_session(self, no_credentials, tmp_path):
-        """Off-session frames are discarded by design, so a rehearsal that
-        stamped 'now' at 07:00 IST would produce no bars and prove nothing."""
+        """Off-session frames are discarded by design, so a rehearsal stamped
+        outside the session would produce no bars and prove nothing.
+
+        The assertion is "inside the session", not a fixed clock reading: run
+        during market hours the rehearsal anchors to now, and asserting 09:15
+        made the test pass only before the open.
+        """
         out = tmp_path / "rec"
         record_ticks.main([
             "--out", str(out), "--rehearse", "3",
@@ -105,12 +110,12 @@ class TestRehearsal:
 
         shard = list(iter_shards(out))[0]
         frames = [r.payload for r in read_shard(shard)]
-        # Decode the first frame's timestamp; it must sit inside 09:15-15:40.
-        pkt = decode_packet(frames[0])
         # exchange_timestamp is epoch milliseconds, per the wire format.
         ist_ts = dt.datetime.fromtimestamp(
-            pkt.exchange_timestamp / 1000, tz=dt.timezone.utc).astimezone(IST)
-        assert ist_ts.hour == 9 and ist_ts.minute == 15, ist_ts
+            decode_packet(frames[0]).exchange_timestamp / 1000,
+            tz=dt.timezone.utc).astimezone(IST)
+        cal = MarketCalendar(Market.NSE, segment="NSE_FNO")
+        assert cal.session_containing(ist_ts) is not None, ist_ts
 
     def test_rehearsal_bars_have_delta_and_poc(self, no_credentials, tmp_path):
         """A rehearsal that produces a bar with no delta has proved the plumbing
