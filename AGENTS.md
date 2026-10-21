@@ -236,9 +236,21 @@ Invariants that took a bug each to learn:
   must not kill a live session.
 - `ShardTransport` reports unreadable shards in `torn_shards` and keeps going.
   One bad file must not abort a month-long replay.
-- The router keys on `(namespace, token)` and **silently drops an unregistered
-  token**. That reads as a decoder failure, so `replay_backtest.py` requires
-  `--instruments` and says so when nothing was routed.
+- The router keys on `(namespace, token)`. `TickRouter.route` returns three
+  things and callers must not conflate them: a `RoutedTrade`, `None` for "known
+  token, no new trade" (quote-only update or the baseline tick), and the
+  `UNMAPPED` sentinel for a token the mapper does not know. `None` is normal;
+  only `UNMAPPED` counts toward `stats.unmapped`. Returning `None` for both
+  made every baseline and every quote update look like a config fault, which
+  `record_ticks.py --rehearse` then reported as a decoder failure.
+- `TickReader` treats the **first tick of a stream as a baseline**, not a
+  trade: its `volume_trade_for_the_day` is the whole day's volume so far.
+  Booking it as one print put 1,061,320 contracts into a single bar on a real
+  09:46 attach against 11,505 for every genuine print after it, so the bar's
+  delta, POC and imbalance were decided by one synthetic trade. Skipping costs
+  at most the first print's size at a true session open; not skipping destroys
+  the bar on any mid-session attach. `state.has_baseline` records that the
+  baseline was taken.
 - `record_ticks.py` exits non-zero when it recorded nothing. An accepted
   subscription outside its session streams silence, indistinguishable from a
   quiet market.

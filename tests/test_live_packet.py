@@ -144,6 +144,13 @@ class TestSideInferenceOnTheRealBook:
             scale=t.scale,
         )
         r = TickReader(t.token, scale=t.scale)
+        # A baseline tick, then the print under test: the reader emits no trade
+        # from the first tick of a stream.
+        r.read(decode_packet(encode_tick(TickSpec(
+            mode=spec.mode, exchange_type=spec.exchange_type, token=spec.token,
+            exchange_timestamp_ms=spec.exchange_timestamp_ms,
+            last_traded_price=real_ask, volume_trade_for_the_day=0,
+            bids=spec.bids, asks=spec.asks, scale=t.scale))))
         tt = r.read(decode_packet(encode_tick(spec)))
         assert tt is not None
         assert tt.trade.side is Side.BUY
@@ -169,6 +176,11 @@ class TestSideInferenceOnTheRealBook:
             scale=t.scale,
         )
         r = TickReader(t.token, scale=t.scale)
+        r.read(decode_packet(encode_tick(TickSpec(
+            mode=spec.mode, exchange_type=spec.exchange_type, token=spec.token,
+            exchange_timestamp_ms=spec.exchange_timestamp_ms,
+            last_traded_price=real_bid, volume_trade_for_the_day=0,
+            bids=spec.bids, asks=spec.asks, scale=t.scale))))
         tt = r.read(decode_packet(encode_tick(spec)))
         assert tt is not None
         assert tt.trade.side is Side.SELL

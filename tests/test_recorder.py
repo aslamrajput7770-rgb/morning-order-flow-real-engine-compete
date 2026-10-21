@@ -283,11 +283,12 @@ class TestShardTransport:
         assert stats.protocol_errors == 0
         assert len(chart.bars) == 1
         bar = chart.bars[-1]
-        # Same numbers the live capture produced: the first print carries the
-        # whole day's cumulative volume, so it counts as its own increment.
-        assert bar.total_volume == 1065 + 39 * 65
+        # The first frame is a baseline and carries no trade, so 40 frames give
+        # 39 prints of 65. Previously the baseline was booked as a trade and its
+        # 1,065 contracts dominated the bar.
+        assert bar.total_volume == 39 * 65
         assert bar.delta == 845
-        assert bar.poc == 22894.95
+        assert bar.trade_count == 39
 
 
 class TestShardSummary:

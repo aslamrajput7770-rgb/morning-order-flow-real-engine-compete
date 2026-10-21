@@ -237,10 +237,31 @@ class TestTickReaderVolumeDifferencing:
     def test_cumulative_volume_becomes_incremental(self):
         """Feeding cumulative volume straight in puts the whole day in one bar."""
         r = TickReader("26000")
-        t1 = r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1000))))
+        baseline = r.read(
+            decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1000)))
+        )
         t2 = r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1075))))
-        assert t1.trade.size == 1000.0  # first print, no prior baseline
+        assert baseline is None  # the first tick is a baseline, not a trade
         assert t2.trade.size == 75.0  # 1075 - 1000, not 1075
+
+    def test_the_first_tick_of_a_mid_session_attach_is_not_a_trade(self):
+        """Attaching at 09:46, the first tick carries the whole day's volume.
+
+        Booking it as one print put 1,061,320 contracts into a single bar
+        against 11,505 for every genuine buy print afterwards, so the bar's
+        delta, POC and imbalance were all decided by one synthetic trade.
+        """
+        r = TickReader("26000")
+        first = r.read(
+            decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1061320)))
+        )
+        assert first is None
+        assert r.state.has_baseline
+        # The next genuine print is differenced against the baseline.
+        nxt = r.read(
+            decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1061385)))
+        )
+        assert nxt.trade.size == 65.0
 
     def test_unchanged_volume_emits_no_trade(self):
         """A quote update with no fill must not create a zero-size print."""
@@ -248,7 +269,7 @@ class TestTickReaderVolumeDifferencing:
         r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1000))))
         again = r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1000))))
         assert again is None
-        assert r.state.prints == 1
+        assert r.state.prints == 0  # the baseline is not a print either
 
     def test_volume_reset_at_session_open_is_not_negative(self):
         """Day volume restarting at 0 must not inject a huge negative print."""
@@ -260,11 +281,13 @@ class TestTickReaderVolumeDifferencing:
 
     def test_price_is_unscaled(self):
         r = TickReader("26000")
+        r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=0))))
         tt = r.read(decode_packet(encode_tick(snap_spec(last_traded_price=24000.05))))
         assert tt.trade.price == 24000.05
 
     def test_timestamp_is_seconds(self):
         r = TickReader("26000")
+        r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=0))))
         tt = r.read(decode_packet(encode_tick(snap_spec(exchange_timestamp_ms=1784000000000))))
         assert tt.trade.ts == 1784000000.0
 
@@ -272,6 +295,7 @@ class TestTickReaderVolumeDifferencing:
 class TestTickReaderSideInference:
     def test_quote_rule_buy_when_at_ask(self):
         r = TickReader("26000")
+        r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=0))))
         tt = r.read(
             decode_packet(
                 encode_tick(
@@ -285,6 +309,7 @@ class TestTickReaderSideInference:
 
     def test_quote_rule_sell_when_at_bid(self):
         r = TickReader("26000")
+        r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=0))))
         tt = r.read(
             decode_packet(
                 encode_tick(
@@ -437,23 +462,27 @@ class TestConnector:
 
     def test_emits_trades_from_real_packets(self):
         frames = [
+            # The first tick is a baseline, so two trades need three frames.
             encode_tick(snap_spec(volume_trade_for_the_day=1000)),
             encode_tick(snap_spec(volume_trade_for_the_day=1075)),
+            encode_tick(snap_spec(volume_trade_for_the_day=1150)),
         ]
         conn, _ = self._connector(frames)
         got = []
         conn.run(on_trade=got.append)
         assert len(got) == 2
+        assert got[0].trade.size == 75.0
         assert got[1].trade.size == 75.0
         assert got[1].instrument is NIFTY_FUT
 
     def test_heartbeats_are_skipped_not_parsed(self):
         """Heartbeats must not be parsed as ticks; None ends the stream."""
-        frames = ["ping", b"", encode_tick(snap_spec()), "ping"]
+        frames = ["ping", b"", encode_tick(snap_spec(volume_trade_for_the_day=1000)),
+                  encode_tick(snap_spec(volume_trade_for_the_day=1100)), "ping"]
         conn, _ = self._connector(frames)
         got = []
         stats = conn.run(on_trade=got.append)
-        assert len(got) == 1
+        assert len(got) == 1  # the baseline tick produces no trade
         assert stats.heartbeats == 3  # two leading + one trailing; None ends the stream
         assert stats.protocol_errors == 0
 
@@ -465,9 +494,13 @@ class TestConnector:
         assert b'"action": 1' in transport.sent[0]
 
     def test_protocol_error_counted_not_raised(self):
-        bad = bytearray(encode_tick(snap_spec()))
+        bad = bytearray(encode_tick(snap_spec(volume_trade_for_the_day=1000)))
         bad[0] = 9
-        conn, _ = self._connector([bytes(bad), encode_tick(snap_spec())])
+        conn, _ = self._connector([
+            bytes(bad),
+            encode_tick(snap_spec(volume_trade_for_the_day=1000)),  # baseline
+            encode_tick(snap_spec(volume_trade_for_the_day=1075)),  # the trade
+        ])
         got = []
         stats = conn.run(on_trade=got.append)
         assert stats.protocol_errors == 1
@@ -485,7 +518,8 @@ class TestConnector:
         conn, _ = self._connector(frames)
         got = []
         conn.run(on_trade=got.append, max_frames=5)
-        assert len(got) == 5
+        # Five frames consumed; the first is a baseline, so four trades.
+        assert len(got) == 4
 
     def test_transport_closed(self):
         conn, transport = self._connector([encode_tick(snap_spec())])
@@ -509,6 +543,21 @@ class TestEndToEndIngestion:
         plan = build_plan([(TokenNamespace.NSE_FO, int(token))])
         base_ms = int(datetime(day.year, day.month, day.day, 9, 20, tzinfo=IST).timestamp() * 1000)
         frames = []
+        # The reader treats the first tick of a stream as a baseline and emits
+        # no trade from it, so start from zero volume: the first real print is
+        # then the first increment and the requested volumes land exactly.
+        frames.append(
+            encode_tick(
+                snap_spec(
+                    token=token,
+                    last_traded_price=prices_volumes[0][0],
+                    volume_trade_for_the_day=0,
+                    exchange_timestamp_ms=base_ms - 30000,
+                    bids=((round(prices_volumes[0][0] - 0.05, 2), 100),),
+                    asks=((prices_volumes[0][0], 100),),
+                )
+            )
+        )
         for i, (p, v, side) in enumerate(prices_volumes):
             if side is Side.BUY:
                 bid, ask = round(p - 0.05, 2), p
@@ -562,6 +611,11 @@ class TestEndToEndIngestion:
         def day_frames(day, base_vol):
             base_ms = int(datetime(day.year, day.month, day.day, 9, 20, tzinfo=IST).timestamp() * 1000)
             return [
+                # A zero-volume baseline, then three 100-lot buys.
+                encode_tick(snap_spec(last_traded_price=24000.05, volume_trade_for_the_day=base_vol,
+                                      exchange_timestamp_ms=base_ms,
+                                      bids=((24000.00, 10),), asks=((24000.05, 10),)))
+            ] + [
                 encode_tick(snap_spec(last_traded_price=24000.05, volume_trade_for_the_day=base_vol + i * 100,
                                       exchange_timestamp_ms=base_ms + i * 60000,
                                       bids=((24000.00, 10),), asks=((24000.05, 10),)))
@@ -604,10 +658,18 @@ class TestEndToEndIngestion:
         chart = SessionChart(MCX_GOLD_FUT.grid(), cal, bar_seconds=300)
         base_ms = int(datetime(2026, 11, 9, 22, 0, tzinfo=IST).timestamp() * 1000)
         frames = [
+            # Zero-volume baseline; the reader emits no trade from it.
+            encode_tick(
+                snap_spec(exchange_type=ExchangeType.MCX_FO, token="42809",
+                          last_traded_price=71001.0, volume_trade_for_the_day=0,
+                          exchange_timestamp_ms=base_ms,
+                          bids=((71000.0, 5),), asks=((71001.0, 5),))
+            )
+        ] + [
             encode_tick(
                 snap_spec(exchange_type=ExchangeType.MCX_FO, token="42809",
                           last_traded_price=71001.0, volume_trade_for_the_day=100 * (i + 1),
-                          exchange_timestamp_ms=base_ms + i * 60000,
+                          exchange_timestamp_ms=base_ms + (i + 1) * 60000,
                           bids=((71000.0, 5),), asks=((71001.0, 5),))
             )
             for i in range(3)
@@ -690,14 +752,20 @@ class TestLiveTransportSemantics:
         minute, which looks exactly like a market outage.
         """
         clock = [0.0]
-        t = _FakeTransport([None, None, encode_tick(snap_spec()), None], is_live=True, clock=clock)
+        t = _FakeTransport(
+            [None, None, encode_tick(snap_spec(volume_trade_for_the_day=1000)),
+             encode_tick(snap_spec(volume_trade_for_the_day=1075)), None],
+            is_live=True, clock=clock)
         got = []
         self._conn(t).run(on_trade=got.append, max_seconds=100, clock=lambda: clock[0])
         assert len(got) == 1, "the trade after the idle period must still arrive"
 
     def test_replay_none_still_ends_the_stream(self):
         """The offline path must keep terminating on exhaustion."""
-        t = _FakeTransport([encode_tick(snap_spec()), None], is_live=False)
+        t = _FakeTransport(
+            [encode_tick(snap_spec(volume_trade_for_the_day=1000)),
+             encode_tick(snap_spec(volume_trade_for_the_day=1075)), None],
+            is_live=False)
         got = []
         self._conn(t).run(on_trade=got.append)
         assert len(got) == 1
@@ -909,6 +977,7 @@ class TestCaptureDiagnostics:
         frames = [
             encode_tick(_sane_spec(seq=1, ltp=24000.10, vol=1000)),
             encode_tick(_sane_spec(seq=2, ltp=23999.95, vol=1100)),
+            encode_tick(_sane_spec(seq=3, ltp=24000.10, vol=1200)),
         ]
         diag = scan_frames(frames)
         assert diag.trades == 2

@@ -444,18 +444,19 @@ class TestReplay:
 
         for _ in range(50):
             body = tc.get("/api/status").json()
-            if body["trades"] >= 40:
+            if body["trades"] >= 39:
                 break
             time.sleep(0.1)
-        assert body["trades"] == 40, body
+        # 40 frames, but the first is a baseline and emits no trade.
+        assert body["trades"] == 39, body
         assert body["last_error"] is None
 
         chart = tc.get("/api/chart/NSE_FO_48704").json()
         assert chart["bars"], "no bars built from an in-session capture"
         bar = chart["bars"][-1]
-        # The first print of a session carries the whole cumulative volume for
-        # the day, so it counts as its own increment: 1065 + 39 * 65 = 3600.
-        assert bar["volume"] == 1065 + 39 * 65
+        # 39 prints of 65. The baseline frame is not booked as a trade, so the
+        # bar is not dominated by the day's cumulative volume.
+        assert bar["volume"] == 39 * 65
         assert bar["buy"] + bar["sell"] == bar["volume"]
         assert bar["delta"] == bar["buy"] - bar["sell"]
         assert bar["poc"] is not None

@@ -61,6 +61,7 @@ class TickReaderState:
     """Per-token running state. One per instrument, never shared."""
 
     last_volume: float = 0.0
+    has_baseline: bool = False
     last_price_raw: int | None = None
     best_bid_raw: int | None = None
     best_ask_raw: int | None = None
@@ -168,6 +169,23 @@ class TickReader:
             self._price_checked = True
 
         cumulative = float(raw.volume_trade_for_the_day or 0.0)
+        if not state.has_baseline:
+            # The first tick of a stream is a baseline, not a trade. Its
+            # cumulative volume is the whole day's volume so far, and booking it
+            # as one print drops the entire session into a single bar: on a real
+            # 09:46 attach that was 1,061,320 contracts against 11,505 for every
+            # genuine buy print afterwards. An incremental-volume feed starts
+            # near zero and is unaffected, because the first increment is small
+            # either way.
+            state.has_baseline = True
+            state.last_volume = cumulative
+            state.last_price_raw = price_raw
+            if raw.bids:
+                state.best_bid_raw = raw.bids[0].price_raw
+            if raw.asks:
+                state.best_ask_raw = raw.asks[0].price_raw
+            return None
+
         if cumulative < state.last_volume:
             # Session rollover or feed restart: treat the new value as the first
             # increment rather than a negative one.

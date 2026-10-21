@@ -251,6 +251,15 @@ class RoutedTrade:
     source: str
 
 
+# Returned by `TickRouter.route` for a tick whose token the mapper does not
+# know. This is distinct from `None`, which means "a known token, but this tick
+# carried no new trade" (a quote-only update or the first baseline tick).
+# Collapsing the two made every baseline and every quote update look like an
+# unmapped token, which the rehearsal and capture diagnostics treat as a
+# configuration fault.
+UNMAPPED = object()
+
+
 class TickRouter:
     """Routes decoded ticks to per-instrument readers.
 
@@ -278,17 +287,23 @@ class TickRouter:
             r = self._readers[key] = TickReader(str(token))
         return r
 
-    def route(self, raw: RawTick) -> RoutedTrade | None:
-        """Route one tick. Returns None for quote-only updates and unknown tokens."""
+    def route(self, raw: RawTick):
+        """Route one tick.
+
+        Returns a `RoutedTrade`, or `None` when the tick carried no new trade
+        (a quote-only update, or the first baseline tick of a stream), or the
+        `UNMAPPED` sentinel when the token is not in the mapper. The caller must
+        tell the last two apart: one is normal, the other is a config fault.
+        """
         namespace = self._namespace_by_exchange.get(raw.exchange_type)
         if namespace is None:
-            return None
+            return UNMAPPED
         try:
             instrument = self.mapper.by_token(namespace, int(raw.token))
         except Exception:
-            # An unmapped token is a configuration gap, not a crash. Count it
-            # at the connector level; here it is simply not ours.
-            return None
+            # An unmapped token is a configuration gap, not a crash. Surface it
+            # as a distinct outcome; the connector decides how to count it.
+            return UNMAPPED
         reader = self.reader_for(namespace, int(raw.token))
         tt = reader.read(raw)
         if tt is None:
@@ -469,8 +484,12 @@ class SmartStreamConnector:
             return
         self.stats.ticks += 1
         routed = self.router.route(raw)
-        if routed is None:
+        if routed is UNMAPPED:
             self.stats.unmapped += 1
+            return
+        if routed is None:
+            # A known token with no new trade: quote-only update or the first
+            # baseline tick. Normal, and not a trade.
             return
         self.stats.trades += 1
         on_trade(routed)
