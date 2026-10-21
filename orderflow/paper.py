@@ -127,6 +127,9 @@ class Position:
     realized_pnl: float = 0.0
     costs: float = 0.0
     last_price: float = 0.0
+    #: When the position was opened (from flat), so a round trip can report the
+    #: real entry time instead of the exit time twice.
+    opened_ts: float = 0.0
 
     @property
     def is_flat(self) -> bool:
@@ -319,6 +322,8 @@ class PaperBroker:
 
         if pos.qty == 0 or (pos.qty > 0) == (signed > 0):
             # Opening or adding on the same side: blend the average price.
+            if pos.qty == 0:
+                pos.opened_ts = fill.ts
             new_qty = pos.qty + signed
             if new_qty != 0:
                 pos.avg_price = (
@@ -335,11 +340,14 @@ class PaperBroker:
         self.cash += gross
         self.round_trips.append(RoundTrip(
             symbol=fill.symbol,
-            side=Side.SELL if pos.qty > 0 else Side.BUY,
+            # The side of the *entry*, which is the side of the position being
+            # closed: a long is opened by a BUY. Labelling it with the exit side
+            # made a winning long report side=SELL against gross=+3609.
+            side=Side.BUY if pos.qty > 0 else Side.SELL,
             qty=closing,
             entry_price=pos.avg_price,
             exit_price=fill.price,
-            entry_ts=fill.ts,
+            entry_ts=pos.opened_ts,
             exit_ts=fill.ts,
             gross=gross,
             costs=fill.cost,
@@ -348,8 +356,10 @@ class PaperBroker:
         if pos.qty == 0:
             pos.avg_price = 0.0
         elif (pos.qty > 0) != (direction > 0):
-            # Flipped through zero: the remainder opens at the fill price.
+            # Flipped through zero: the remainder opens at the fill price, and
+            # now, so the next round trip times its entry from this fill.
             pos.avg_price = fill.price
+            pos.opened_ts = fill.ts
 
     # ------------------------------------------------------------------- marks
     def mark(self, symbol: str, price: float) -> None:

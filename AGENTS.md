@@ -340,6 +340,11 @@ Invariants that took a bug each to learn:
   from `unmapped` (a token absent from the master, which is a real config
   fault): one means "a real instrument we did not ask for", the other means "the
   master is stale".
+- **A round trip records the entry side, not the exit side.** `RoundTrip.side`
+  is the side of the position that was closed: a long is opened by a BUY. Taking
+  it from the closing fill labelled a winning long as `side=SELL` against a
+  positive `gross`, a self-contradicting record. `entry_ts` comes from the
+  position's `opened_ts`, so it is the real entry time, not the exit time twice.
 - Credentials come from the environment only: `ANGEL_API_KEY`,
   `ANGEL_CLIENT_CODE`, `ANGEL_PIN`, `ANGEL_TOTP_SECRET`. Never from arguments,
   never written to disk, never committed.

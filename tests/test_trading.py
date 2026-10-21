@@ -159,6 +159,35 @@ class TestPaperBroker:
         assert rt.net == pytest.approx(rt.gross - rt.costs)
         assert rt.net < rt.gross, "costs must reduce the round trip"
 
+    def test_winning_long_reports_buy_side(self):
+        """A long is opened by a BUY; the round trip must say so.
+
+        The side was taken from the closing fill, so a profitable long reported
+        side=SELL against a positive gross: a self-contradicting record.
+        """
+        broker = PaperBroker(cash=1_000_000.0, slippage_ticks=0)
+        broker.register("X", lot_size=10, tick_size=0.05)
+        broker.submit_market("X", Side.BUY, 1, ts=10.0)
+        broker.on_trade("X", 100.0, 10.0)
+        broker.submit_market("X", Side.SELL, 1, ts=20.0)
+        broker.on_trade("X", 110.0, 20.0)
+        rt = broker.round_trips[-1]
+        assert rt.side is Side.BUY
+        assert rt.gross > 0, "a long that exits higher is a profit"
+        assert rt.entry_ts == pytest.approx(10.0)
+        assert rt.exit_ts == pytest.approx(20.0)
+
+    def test_winning_short_reports_sell_side(self):
+        broker = PaperBroker(cash=1_000_000.0, slippage_ticks=0)
+        broker.register("X", lot_size=10, tick_size=0.05)
+        broker.submit_market("X", Side.SELL, 1, ts=10.0)
+        broker.on_trade("X", 100.0, 10.0)
+        broker.submit_market("X", Side.BUY, 1, ts=20.0)
+        broker.on_trade("X", 90.0, 20.0)
+        rt = broker.round_trips[-1]
+        assert rt.side is Side.SELL
+        assert rt.gross > 0, "a short that exits lower is a profit"
+
     def test_limit_order_only_fills_when_price_reaches_it(self):
         broker = PaperBroker(cash=1_000_000.0)
         broker.register("X", lot_size=1, tick_size=0.05)
