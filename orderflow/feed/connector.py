@@ -287,6 +287,10 @@ class TickRouter:
             r = self._readers[key] = TickReader(str(token))
         return r
 
+    def namespace_for(self, raw: RawTick) -> TokenNamespace | None:
+        """The namespace a tick's exchange maps to, or None if unknown."""
+        return self._namespace_by_exchange.get(raw.exchange_type)
+
     def route(self, raw: RawTick):
         """Route one tick.
 
@@ -295,7 +299,7 @@ class TickRouter:
         `UNMAPPED` sentinel when the token is not in the mapper. The caller must
         tell the last two apart: one is normal, the other is a config fault.
         """
-        namespace = self._namespace_by_exchange.get(raw.exchange_type)
+        namespace = self.namespace_for(raw)
         if namespace is None:
             return UNMAPPED
         try:
@@ -331,6 +335,9 @@ class ConnectorStats:
     heartbeats: int = 0
     protocol_errors: int = 0
     unmapped: int = 0
+    #: Ticks for a token that is in the master but not in the plan. Live never
+    #: sends these; a replay shard carries every token it recorded.
+    not_subscribed: int = 0
     reconnects: int = 0
 
 
@@ -360,6 +367,14 @@ class SmartStreamConnector:
         self.router = TickRouter(mapper)
         self.stats = ConnectorStats()
         self._last_heartbeat = 0.0
+        #: (namespace, token) pairs the plan actually asked for. A live server
+        #: sends nothing else, but a replay shard holds every token that was
+        #: recorded on the connection, so without this filter a one-instrument
+        #: replay routes the whole shard and trades instruments the caller never
+        #: asked for.
+        self._subscribed: set[tuple[TokenNamespace, int]] = {
+            (sub.namespace, int(sub.token)) for sub in plan.all()
+        }
 
     # ------------------------------------------------------------- lifecycle
     def _subscribe(self, transport: Transport, index: int) -> None:
@@ -483,6 +498,21 @@ class SmartStreamConnector:
                 self.on_error(exc)
             return
         self.stats.ticks += 1
+        # A token the plan never asked for is not our tick. Live cannot produce
+        # one; a replay shard carries every token recorded on the connection.
+        # Drop it before the reader sees it, so its volume-delta state cannot
+        # even be seeded by a stream we are not trading.
+        namespace = self.router.namespace_for(raw)
+        if namespace is None or (namespace, int(raw.token)) not in self._subscribed:
+            # Tell a configuration gap (token absent from the master, a fault)
+            # apart from a replay artefact (a real instrument we did not
+            # subscribe to). The two must not share a counter: one means the
+            # master is stale, the other is normal for a replay.
+            if self._known_token(namespace, raw.token):
+                self.stats.not_subscribed += 1
+            else:
+                self.stats.unmapped += 1
+            return
         routed = self.router.route(raw)
         if routed is UNMAPPED:
             self.stats.unmapped += 1
@@ -493,6 +523,16 @@ class SmartStreamConnector:
             return
         self.stats.trades += 1
         on_trade(routed)
+
+    def _known_token(self, namespace: TokenNamespace | None, token) -> bool:
+        """True when the token exists in the master (regardless of the plan)."""
+        if namespace is None:
+            return False
+        try:
+            self.mapper.by_token(namespace, int(token))
+        except Exception:
+            return False
+        return True
 
     def maybe_heartbeat(
         self,

@@ -531,6 +531,41 @@ class TestConnector:
         assert stats.unmapped == 1
         assert got == []
 
+    def test_a_token_outside_the_plan_is_not_routed(self):
+        """A replay shard holds every token on the connection, not just ours.
+
+        Subscribing to NIFTY alone and replaying a shard that also holds
+        BANKNIFTY must not route BANKNIFTY. Without this, a one-instrument
+        replay trades instruments the caller never asked for, and every
+        strategy conclusion drawn from that replay is unsound.
+        """
+        conn, _ = self._connector([
+            encode_tick(snap_spec(token="26001", volume_trade_for_the_day=1000)),
+            encode_tick(snap_spec(token="26001", volume_trade_for_the_day=1075)),
+        ])  # plan subscribes to 26000 only
+        got = []
+        stats = conn.run(on_trade=got.append)
+        assert got == [], "an unsubscribed token must not reach on_trade"
+        assert stats.trades == 0
+        assert stats.not_subscribed == 2
+        assert stats.unmapped == 0, "a real token we did not subscribe is not unmapped"
+
+    def test_the_subscribed_token_still_flows_when_others_are_present(self):
+        """The filter must drop only foreign tokens, never our own."""
+        frames = [
+            encode_tick(snap_spec(token="26001", volume_trade_for_the_day=500)),
+            encode_tick(snap_spec(token="26000", volume_trade_for_the_day=1000)),
+            encode_tick(snap_spec(token="26001", volume_trade_for_the_day=550)),
+            encode_tick(snap_spec(token="26000", volume_trade_for_the_day=1075)),
+        ]
+        conn, _ = self._connector(frames)  # plan: 26000 only
+        got = []
+        stats = conn.run(on_trade=got.append)
+        assert len(got) == 1
+        assert got[0].trade.size == 75.0
+        assert got[0].instrument is NIFTY_FUT
+        assert stats.not_subscribed == 2
+
     def test_max_frames_stops_consumption(self):
         frames = [encode_tick(snap_spec(volume_trade_for_the_day=100 + i)) for i in range(50)]
         conn, _ = self._connector(frames)
