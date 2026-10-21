@@ -203,3 +203,51 @@ Replay is the live-backtest path: `FileTransport` feeds recorded frames through
 the same decoder, router, tick reader and session chart as a live socket. No
 synthetic trades are injected below the transport, so a replay exercises the
 real pipeline.
+
+## Recording (the only source of real order flow)
+
+A footprint cannot be rebuilt from candles: the bid/ask split at each price
+exists only in the live stream. Angel One's historical API returns OHLCV, so
+the data has to be captured live. `record_ticks.py` does the capture;
+`replay_backtest.py` reads it back.
+
+`orderflow/recorder.py` — `ShardRecorder(dir, key, fsync_every)` appends gzipped
+binary records to an hourly shard. `MultiRecorder` keeps one shard set per
+connection. Module functions: `read_shard`, `iter_shards`, `finalize_parts`,
+`shard_summary`; constants `TYPE_BINARY`, `TYPE_TEXT`, `MAGIC`.
+
+Invariants that took a bug each to learn:
+
+- The recorder tees the **raw socket stream**, not per-instrument trades. A
+  frame does not name its instrument until decoded, and the decoder already
+  exists on the replay side. So a shard stores what the socket delivered, and
+  replay routes it through the same code path as a live session. A decoder fix
+  then applies retroactively to every recording.
+- Writes go to `<hour>.oft.gz.part` and are renamed only after the hour rolls.
+  `finalize_parts` promotes a `.part` left by a crash. A `kill -9` costs the
+  last batch, not the file.
+- A torn gzip tail raises **`EOFError`, not `OSError`**. `read_shard` catches
+  both and falls back to a tolerant zlib inflate, so a killed process costs the
+  last record rather than the whole shard. Catching only `OSError` was a real
+  bug: it made every crash-safety test pass and every real crash lose data.
+- `ShardRecorder.flush()` must never be called while the write lock is held.
+  `threading.Lock` is not reentrant; nesting it deadlocks the feed thread.
+- `RecordingTransport.recv()` swallows recorder write failures. A full disk
+  must not kill a live session.
+- `ShardTransport` reports unreadable shards in `torn_shards` and keeps going.
+  One bad file must not abort a month-long replay.
+- The router keys on `(namespace, token)` and **silently drops an unregistered
+  token**. That reads as a decoder failure, so `replay_backtest.py` requires
+  `--instruments` and says so when nothing was routed.
+- `record_ticks.py` exits non-zero when it recorded nothing. An accepted
+  subscription outside its session streams silence, indistinguishable from a
+  quiet market.
+- Credentials come from the environment only: `ANGEL_API_KEY`,
+  `ANGEL_CLIENT_CODE`, `ANGEL_PIN`, `ANGEL_TOTP_SECRET`. Never from arguments,
+  never written to disk, never committed.
+
+`orderflow/watchlist.py` owns the desk watchlist and the MCX tick table;
+`dashboard.py` delegates to it. There is one tick rule, not two.
+
+Recordings are large and machine-specific: `recordings/` and `*.oft.gz` are
+gitignored.
