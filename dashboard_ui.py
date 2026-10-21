@@ -295,12 +295,18 @@ async function post(url, body){
   return r.json();
 }
 $("btnStart").onclick = async () => {
-  const r = await post("/api/feed/start", {mode:"live"});
+  // Credentials live on the server. Ask for a recording path here, because a
+  // session that is not recorded cannot be replayed later.
+  const rec = prompt(
+    "Record this session to (blank to not record):", "recordings");
+  const body = {mode:"live"};
+  if(rec) body.record = rec;
+  const r = await post("/api/feed/start", body);
   if(r.detail) alert(r.detail);
 };
 $("btnReplay").onclick = async () => {
-  const path = prompt("Capture file path (from live_feed.py --record):",
-                      "/tmp/cap_live.txt");
+  const path = prompt(
+    "Recording directory or capture file to replay:", "recordings");
   if(!path) return;
   const r = await post("/api/feed/start", {mode:"replay", path});
   if(r.detail) alert(r.detail);

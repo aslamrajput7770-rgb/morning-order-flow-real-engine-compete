@@ -377,7 +377,34 @@ def chart_snapshot(state: DashboardState, key: str, bars: int = 60) -> dict:
     }
 
 
-def build_app(mapper: TokenMapper, master_path: str = "instruments.json") -> FastAPI:
+def _login(credentials: dict) -> dict:
+    """Log in to the broker and return the session tokens.
+
+    Split out so a test can substitute it without a network. The recorder and
+    the feed both need the JWT and the feed token from this response.
+    """
+    from orderflow.feed.transports import login as do_login
+    from orderflow.feed import totp
+
+    return do_login(
+        credentials["api_key"], credentials["client_code"],
+        credentials["pin"], totp(credentials["totp_secret"]),
+    )
+
+
+def build_app(
+    mapper: TokenMapper,
+    master_path: str = "instruments.json",
+    credentials: dict | None = None,
+    record_dir: str | None = None,
+) -> FastAPI:
+    """Build the dashboard app.
+
+    `credentials` and `record_dir` let the page start a live session on its
+    own. Without them the page can still search instruments and replay a
+    recording, and "Start live" says why it cannot proceed rather than opening
+    a socket it has no token for.
+    """
     app = FastAPI(title="Order Flow Engine")
     state = DashboardState()
     # The endpoints mutate `state.watchlist` directly. `app.state.watchlist` is
@@ -488,10 +515,31 @@ def build_app(mapper: TokenMapper, master_path: str = "instruments.json") -> Fas
             if mode == "replay":
                 runner.start_replay(body["path"])
             else:
+                # Log in here when the server holds credentials. The page never
+                # sees the PIN or the TOTP secret, and the login happens on the
+                # server's network rather than in the browser.
+                session = body.get("session")
+                api_key = body.get("api_key", "")
+                client_code = body.get("client_code", "")
+                feed_token = body.get("feed_token", "")
+                if session is None:
+                    if not credentials:
+                        raise HTTPException(
+                            400,
+                            "no credentials on the server: set ANGEL_API_KEY, "
+                            "ANGEL_CLIENT_CODE, ANGEL_PIN and ANGEL_TOTP_SECRET, "
+                            "or start a replay instead",
+                        )
+                    session = _login(credentials)
+                    api_key = credentials["api_key"]
+                    client_code = credentials["client_code"]
+                    feed_token = session.get("feedToken", "")
                 runner.start_live(
-                    body["session"], body["api_key"], body["client_code"],
-                    body.get("feed_token", ""), body.get("record"),
+                    session, api_key, client_code, feed_token,
+                    body.get("record") or record_dir,
                 )
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(400, str(exc))
         return {"ok": True, "status": state.status}

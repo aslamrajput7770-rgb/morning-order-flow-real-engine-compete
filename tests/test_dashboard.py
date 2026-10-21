@@ -162,6 +162,100 @@ def _in_session_capture(path: Path, n: int = 40) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+class TestServerSideLogin:
+    """Start live from the page without the page ever seeing a credential."""
+
+    @pytest.fixture()
+    def client(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import dashboard as dash
+        from orderflow.instrument_master import build_live_token_map
+
+        monkeypatch.setattr(dash, "_login", lambda creds: {
+            "jwtToken": "jwt-from-server",
+            "feedToken": "feed-from-server",
+        })
+        mapper, _ = build_live_token_map("instruments.json")
+        app = dash.build_app(
+            mapper, "instruments.json",
+            credentials={"api_key": "k", "client_code": "c",
+                         "pin": "1", "totp_secret": "SECRET"},
+            record_dir=str(tmp_path / "rec"),
+        )
+        app.state.watchlist.extend(default_watchlist(mapper)[:1])
+        return TestClient(app)
+
+    def test_start_live_logs_in_on_the_server(self, client, monkeypatch):
+        import threading
+
+        from orderflow.feed.transports import RecordingTransport
+        from orderflow.feed.transports import WebSocketTransport
+
+        state = client.app.state.dashboard
+        runner = None
+        # Reach the runner through the module-level closure by intercepting
+        # start_live on the state's app: simplest is to let it run and stop.
+        captured = {}
+
+        import dashboard as dash
+        real_start = dash.FeedRunner.start_live
+
+        def spy(self, session, api_key, client_code, feed_token,
+                record_path=None):
+            captured.update(session=session, api_key=api_key,
+                            client_code=client_code, feed_token=feed_token,
+                            record_path=record_path)
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(dash.FeedRunner, "start_live", spy)
+        r = client.post("/api/feed/start", json={"mode": "live"})
+        assert r.status_code == 400
+        assert captured["session"]["jwtToken"] == "jwt-from-server"
+        assert captured["api_key"] == "k"
+        assert captured["client_code"] == "c"
+        assert captured["feed_token"] == "feed-from-server"
+        # The record dir is the server default, so a live session is captured.
+        assert captured["record_path"].endswith("rec")
+
+    def test_start_live_without_credentials_says_so(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        import dashboard as dash
+        from orderflow.instrument_master import build_live_token_map
+
+        mapper, _ = build_live_token_map("instruments.json")
+        app = dash.build_app(mapper, "instruments.json")  # no credentials
+        client = TestClient(app)
+        r = client.post("/api/feed/start", json={"mode": "live"})
+        assert r.status_code == 400
+        assert "ANGEL_API_KEY" in r.json()["detail"]
+
+    def test_an_explicit_session_still_wins(self, client, monkeypatch):
+        """A caller that supplies a session must not trigger a login."""
+        import dashboard as dash
+
+        def boom(creds):
+            raise AssertionError("login should not run")
+
+        monkeypatch.setattr(dash, "_login", boom)
+        captured = {}
+
+        def spy(self, session, api_key, client_code, feed_token,
+                record_path=None):
+            captured.update(session=session)
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(dash.FeedRunner, "start_live", spy)
+        r = client.post("/api/feed/start", json={
+            "mode": "live",
+            "session": {"jwtToken": "given", "feedToken": "given-feed"},
+            "api_key": "mine", "client_code": "me",
+        })
+        assert r.status_code == 400
+        assert captured["session"]["jwtToken"] == "given"
+
+
 class TestRecordingWiring:
     """The dashboard can tee a live session to disk and replay it back."""
 

@@ -47,6 +47,8 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=12000)
     ap.add_argument("--master", default="instruments.json")
     ap.add_argument("--no-default-watchlist", action="store_true")
+    ap.add_argument("--record-dir", default="recordings",
+                    help="where a live session is recorded; empty to disable")
     args = ap.parse_args(argv)
 
     if not Path(args.master).exists():
@@ -57,7 +59,12 @@ def main(argv=None) -> int:
     mapper, stats = build_live_token_map(args.master)
     print(f"master: {stats.loaded}/{stats.total_records} instruments")
 
-    app = build_app(mapper, args.master)
+    creds = credentials_from_env()
+    app = build_app(
+        mapper, args.master,
+        credentials=creds or None,
+        record_dir=args.record_dir or None,
+    )
     if not args.no_default_watchlist:
         items = default_watchlist(mapper)
         app.state.watchlist.extend(items)
@@ -67,7 +74,6 @@ def main(argv=None) -> int:
         if not items:
             print("  (no default instruments resolved from the master)")
 
-    creds = credentials_from_env()
     have = sorted(creds)
     print(f"credentials present: {have if have else 'NONE (replay still works)'}")
 
