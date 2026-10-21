@@ -464,6 +464,28 @@ class TestReplay:
         assert chart["profile"] is not None
         assert chart["profile"]["val"] <= chart["profile"]["poc"] <= chart["profile"]["vah"]
 
+    def test_a_second_replay_does_not_inherit_the_first(self, client):
+        """Replaying twice must show one capture, not two stacked together."""
+        tc, cap = client
+        import time
+
+        def run_once():
+            tc.post("/api/feed/start", json={"mode": "replay", "path": str(cap)})
+            for _ in range(60):
+                if tc.get("/api/status").json()["status"] == "stopped":
+                    break
+                time.sleep(0.1)
+            return tc.get("/api/chart/NSE_FO_48704").json()
+
+        first = run_once()
+        second = run_once()
+        assert first["bars"], "the first replay built no bars"
+        assert len(second["bars"]) == len(first["bars"]), (
+            "the second replay appended to the first run's chart")
+        assert [b["volume"] for b in second["bars"]] == [
+            b["volume"] for b in first["bars"]]
+        assert second["cumulative_delta"] == first["cumulative_delta"]
+
     def test_off_session_capture_is_dropped_not_folded(self, tmp_path):
         """A pre-open frame must not open a session or create a bar."""
         pytest.importorskip("fastapi")

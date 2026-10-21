@@ -101,6 +101,25 @@ class DashboardState:
             self.last_tick_at = time.time()
             self.ticks += 1
 
+    def begin_run(self) -> None:
+        """Clear everything a single feed run owns, before the next one starts.
+
+        Charts and counters belong to one run, not to the process. Keeping them
+        across runs made a second replay append its bars to the first: six bars
+        became twelve, and the volume, delta and POC shown were the sum of two
+        unrelated captures. The watchlist is configuration, so it stays.
+        """
+        with self.lock:
+            self.charts = {}
+            self.labels = {}
+            self.frames = 0
+            self.ticks = 0
+            self.trades = 0
+            self.protocol_errors = 0
+            self.reconnects = 0
+            self.unmapped = 0
+            self.last_tick_at = None
+
 
 class FeedRunner:
     """Owns the feed thread and the connector lifecycle."""
@@ -194,6 +213,8 @@ class FeedRunner:
 
     # --------------------------------------------------------------- runner
     def _launch(self, work, source: str) -> None:
+        # A new run must not inherit the previous run's charts or counters.
+        self.state.begin_run()
         with self.state.lock:
             self.state.running = True
             self.state.status = "starting"
