@@ -163,14 +163,23 @@ class FeedRunner:
         """
         if self.state.running:
             raise RuntimeError("feed already running")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"no capture at {path!r}. Point at a directory of .oft.gz "
+                "shards, or at a single .oft.gz file"
+            )
 
         def factory(index):
-            # A directory holds .oft.gz shards from record_ticks.py; a file is
-            # the older line format. Both feed the same pipeline.
-            if os.path.isdir(path):
+            # A directory holds .oft.gz shards from record_ticks.py; a single
+            # .oft.gz file is one shard; anything else is the older line
+            # format. All three feed the same pipeline.
+            if os.path.isdir(path) or str(path).endswith(".oft.gz"):
                 from orderflow.feed.transports import ShardTransport
 
-                return ShardTransport(path, f"conn{index}")
+                return ShardTransport(
+                    path, f"conn{index}",
+                    shards=None if os.path.isdir(path) else [path],
+                )
             return FileTransport(path)
 
         pairs = [(w.namespace, w.token) for w in self.state.watchlist]
