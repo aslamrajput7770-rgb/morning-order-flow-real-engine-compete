@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -109,6 +110,7 @@ class FeedRunner:
         self.mapper = mapper
         self._stop = threading.Event()
         self._conn: SmartStreamConnector | None = None
+        self._recorder = None
 
     # ------------------------------------------------------------------ live
     def start_live(self, session: dict, api_key: str, client_code: str,
@@ -125,12 +127,24 @@ class FeedRunner:
         token = session.get("feedToken") or feed_token
 
         def factory(index):
-            return WebSocketTransport(
+            ws = WebSocketTransport(
                 auth_token=jwt,
                 api_key=api_key,
                 client_code=client_code,
                 feed_token=token,
             )
+            if record_path:
+                # Tee the live stream to disk so the session can be replayed
+                # later. The tee is transparent: a write failure is swallowed
+                # and the feed keeps running, because a full disk must not take
+                # the desk's data feed down with it.
+                from orderflow.recorder import MultiRecorder
+                from orderflow.feed.transports import RecordingTransport
+
+                if self._recorder is None:
+                    self._recorder = MultiRecorder(record_path)
+                return RecordingTransport(ws, self._recorder, key=f"conn{index}")
+            return ws
 
         self._launch(
             lambda: self._run(lambda: SmartStreamConnector(
@@ -151,6 +165,12 @@ class FeedRunner:
             raise RuntimeError("feed already running")
 
         def factory(index):
+            # A directory holds .oft.gz shards from record_ticks.py; a file is
+            # the older line format. Both feed the same pipeline.
+            if os.path.isdir(path):
+                from orderflow.feed.transports import ShardTransport
+
+                return ShardTransport(path, f"conn{index}")
             return FileTransport(path)
 
         pairs = [(w.namespace, w.token) for w in self.state.watchlist]
@@ -208,6 +228,15 @@ class FeedRunner:
                 self.state.last_error = f"{type(exc).__name__}: {exc}"
                 self.state.status = "error"
         finally:
+            if self._recorder is not None:
+                try:
+                    self._recorder.flush_all()
+                    self._recorder.close_all()
+                except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+                    with self.state.lock:
+                        self.state.last_error = (
+                            f"recorder close failed: {type(exc).__name__}: {exc}")
+                self._recorder = None
             with self.state.lock:
                 self.state.running = False
                 if self.state.status not in ("error",):

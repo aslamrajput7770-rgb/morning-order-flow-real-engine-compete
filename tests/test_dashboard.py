@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import time
 from pathlib import Path
 
 import pytest
 
 from orderflow.feed.protocol import ExchangeType, SubscriptionMode
 from orderflow.feed.simulator import TickSpec, encode_tick
+from dashboard import default_watchlist
 from orderflow.session import Market
 
 
@@ -158,6 +160,107 @@ def _in_session_capture(path: Path, n: int = 40) -> None:
         )
         lines.append("bin:" + encode_tick(spec).hex())
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class TestRecordingWiring:
+    """The dashboard can tee a live session to disk and replay it back."""
+
+    def _recording(self, root, n=30):
+        import datetime as dt
+
+        from orderflow.feed.protocol import ExchangeType, SubscriptionMode
+        from orderflow.feed.simulator import TickSpec, encode_tick
+        from orderflow.recorder import MultiRecorder
+
+        ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
+        base = int(dt.datetime(2026, 10, 21, 10, 30, tzinfo=ist).timestamp() * 1000)
+        rec = MultiRecorder(root, fsync_every=10)
+        vol, px = 1000, 22895.0
+        for i in range(n):
+            px += 0.05 if i % 3 else -0.05
+            vol += 65
+            rec.write("conn0", encode_tick(TickSpec(
+                mode=SubscriptionMode.SNAP_QUOTE,
+                exchange_type=ExchangeType.NSE_FO, token="48704",
+                exchange_timestamp_ms=base + i * 1000,
+                last_traded_price=round(px, 2),
+                volume_trade_for_the_day=vol,
+                bids=((round(px - 0.10, 2), 65),),
+                asks=((round(px + 0.05, 2), 65),),
+            )), ts=base / 1000 + i)
+        rec.close_all()
+
+    def test_live_factory_tees_when_a_record_path_is_given(self, tmp_path):
+        """A live start with a record path must wrap the socket in the tee."""
+        import threading
+
+        from orderflow.feed.transports import RecordingTransport, WebSocketTransport
+        from dashboard import DashboardState, FeedRunner
+        from orderflow.instrument_master import build_live_token_map
+
+        mapper, _ = build_live_token_map("instruments.json")
+        state = DashboardState()
+        state.watchlist = default_watchlist(mapper)[:1]
+        runner = FeedRunner(state, mapper)
+
+        captured = {}
+
+        def fake_run(make_conn):
+            # The connector never opens a socket here: we only want the factory.
+            captured["transport"] = make_conn().transport_factory(0)
+
+        runner._run = fake_run
+        runner.start_live(
+            {"jwtToken": "j", "feedToken": "f"}, "k", "c", "f",
+            record_path=str(tmp_path / "rec"),
+        )
+        for _ in range(50):
+            if "transport" in captured:
+                break
+            threading.Event().wait(0.05)
+        assert isinstance(captured["transport"], RecordingTransport)
+        assert isinstance(captured["transport"]._inner, WebSocketTransport)
+
+    def test_live_factory_is_bare_without_a_record_path(self, tmp_path):
+        import threading
+
+        from orderflow.feed.transports import RecordingTransport, WebSocketTransport
+        from dashboard import DashboardState, FeedRunner
+        from orderflow.instrument_master import build_live_token_map
+
+        mapper, _ = build_live_token_map("instruments.json")
+        state = DashboardState()
+        state.watchlist = default_watchlist(mapper)[:1]
+        runner = FeedRunner(state, mapper)
+        captured = {}
+        runner._run = lambda make_conn: captured.update(
+            t=make_conn().transport_factory(0))
+        runner.start_live({"jwtToken": "j", "feedToken": "f"}, "k", "c", "f")
+        for _ in range(50):
+            if "t" in captured:
+                break
+            threading.Event().wait(0.05)
+        assert isinstance(captured["t"], WebSocketTransport)
+        assert not isinstance(captured["t"], RecordingTransport)
+
+    def test_replay_of_a_shard_directory_produces_bars(self, tmp_path):
+        """A recorded directory must replay through the dashboard pipeline."""
+        from dashboard import DashboardState, FeedRunner
+        from orderflow.instrument_master import build_live_token_map
+
+        self._recording(tmp_path / "rec")
+        mapper, _ = build_live_token_map("instruments.json")
+        state = DashboardState()
+        state.watchlist = default_watchlist(mapper)[:1]
+        runner = FeedRunner(state, mapper)
+        runner.start_replay(str(tmp_path / "rec"))
+        for _ in range(100):
+            if not state.running:
+                break
+            time.sleep(0.05)
+        assert state.status in ("stopped", "error"), state.status
+        assert state.trades > 0, "no trades routed through the shard replay"
+        assert state.charts, "no chart was built"
 
 
 class TestReplay:
