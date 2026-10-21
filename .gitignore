@@ -11,3 +11,9 @@ OpenAPIScripMaster.json
 # Feed captures: market data, often large, re-take as needed.
 capture*.txt
 *.capture
+
+# Tick recordings: large, machine-specific, and regenerable. Never commit.
+recordings/
+*.oft.gz
+*.oft.gz.part
+*.part.orphan

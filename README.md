@@ -326,6 +326,59 @@ Four things this layer has to get right, and does:
    subscriptions per socket across at most 3 sockets are planned automatically;
    subscriptions are re-sent on every reconnect.
 
+## Recording and replay
+
+A footprint cannot be reconstructed from candles. Angel One's historical API
+returns OHLCV, and the bid/ask split at each price only ever exists in the live
+stream. So a real backtest needs the stream captured as it happens, and these
+two tools do that.
+
+### Capture
+
+```bash
+export ANGEL_API_KEY=... ANGEL_CLIENT_CODE=... ANGEL_PIN=... ANGEL_TOTP_SECRET=...
+
+# Check the plan and credentials without opening a socket.
+python3 record_ticks.py --out ./recordings --dry-run
+
+# Run it. Safe to kill at any moment.
+python3 record_ticks.py --out ./recordings
+```
+
+The recorder tees the raw socket stream, not per-instrument trades. A frame
+does not say which instrument it belongs to until it is decoded, and the
+decoder already exists on the replay side, so the shard stores exactly what the
+socket delivered. Replay then runs that through the same router, tick reader
+and session chart as a live session. Nothing is interpreted twice, and a
+decoder fix retroactively applies to every recording ever taken.
+
+Writes are crash-safe. Each shard is appended as `.part.gz` and fsynced, then
+renamed once the hour rolls. A `kill -9` costs the last batch, not the file; a
+torn gzip tail still reads back to the last complete record. Shards rotate
+hourly, compress about 20x on real tick payloads, and a month of one instrument
+fits in tens of megabytes.
+
+The process exits non-zero if it recorded nothing. An accepted subscription
+outside its session streams silence, which is otherwise indistinguishable from
+a quiet market.
+
+### Backtest
+
+```bash
+python3 replay_backtest.py --rec ./recordings --key conn0 \
+    --instruments "NSE_FO:48704:0.05" --out bars.json
+```
+
+It prints the footprint bars, delta, POC and session value area, and can write
+the bars to JSON. Because it drives the production pipeline, a bar that comes
+out wrong here is wrong live too.
+
+`--instruments` is required and is not a convenience. The router keys on
+`(namespace, token)` and drops an unregistered token without complaint, so a
+missing registration reads as a decoder failure rather than a configuration
+mistake. The tool says so when nothing is routed.
+
+
 ## Not included
 
 - Broker authentication and the instrument master file. `WebSocketTransport`
@@ -335,6 +388,7 @@ Four things this layer has to get right, and does:
   placeholder ids.
 - Order routing (SuperDOM models ladder state and fills; sending orders is the
   adapter's job)
-- Historical data storage
+- Historical data storage beyond the tick recorder above. There is no
+  database: recordings are files, and `replay_backtest.py` reads them.
 - The exchange holiday list. `MarketCalendar(holidays=...)` takes it from the
   caller; a guessed holiday is a silently missing day of profile data.

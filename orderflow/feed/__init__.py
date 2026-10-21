@@ -60,7 +60,13 @@ from .tick_reader import (
     require_volume_capable_mode,
 )
 from .simulator import TickSpec, encode_stream, encode_tick
-from .transports import FileTransport, WebSocketTransport, record_frames
+from .transports import (
+    FileTransport,
+    RecordingTransport,
+    ShardTransport,
+    WebSocketTransport,
+    record_frames,
+)
 from .totp import totp
 from .diagnostics import (
     Diagnostics,
@@ -120,6 +126,8 @@ __all__ = [
     # transports
     "WebSocketTransport",
     "FileTransport",
+    "RecordingTransport",
+    "ShardTransport",
     "record_frames",
     # auth helper
     "totp",

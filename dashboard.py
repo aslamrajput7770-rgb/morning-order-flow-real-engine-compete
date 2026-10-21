@@ -51,26 +51,6 @@ from orderflow.session import Market, MarketCalendar
 from orderflow.session_chart import SessionChart
 from orderflow.ticks import TickGrid
 
-# MCX contract sizes differ by a factor of ten between the mini and the full
-# contract, so each has its own tick. The master's own tick_size field is not
-# usable (see instrument_master); these are the exchange rules.
-MCX_TICK_BY_UNDERLYING = {
-    "NATURALGAS": 0.10,
-    "CRUDEOIL": 1.0,
-    "GOLD": 1.0,
-    "GOLDM": 1.0,
-    "GOLDPETAL": 1.0,
-    "SILVER": 1.0,
-    "SILVERM": 0.1,
-    "SILVERMIC": 0.1,
-    "COPPER": 0.05,
-    "ZINC": 0.05,
-    "ALUMINIUM": 0.05,
-    "LEAD": 0.05,
-    "NICKEL": 0.10,
-}
-
-
 @dataclass
 class WatchItem:
     """One instrument the dashboard is streaming."""
@@ -523,41 +503,23 @@ def build_app(mapper: TokenMapper, master_path: str = "instruments.json") -> Fas
 
 
 def _tick_for_watch(inst, market: Market) -> float:
-    if market is Market.MCX:
-        name = (inst.underlying or inst.symbol or "").upper()
-        # Longest match first: "SILVER" is a prefix of "SILVERMIC", and the two
-        # have different ticks. Shortest-match-first is the bug that shipped
-        # once already.
-        for key in sorted(MCX_TICK_BY_UNDERLYING, key=len, reverse=True):
-            if name.startswith(key):
-                return MCX_TICK_BY_UNDERLYING[key]
-        return 1.0
-    return 0.05
+    """Thin alias for the shared rule, kept because tests and callers use it."""
+    from orderflow.watchlist import tick_for
+
+    return tick_for(inst.underlying or inst.symbol or "", market)
 
 
 def default_watchlist(mapper: TokenMapper) -> list[WatchItem]:
     """NSE stock plus the four MCX commodities the desk asked for."""
-    out: list[WatchItem] = []
-    for underlying, mkt, seg in (
-        ("NIFTY", Market.NSE, "NSE_FNO"),
-        ("NATURALGAS", Market.MCX, "MCX_FO"),
-        ("CRUDEOIL", Market.MCX, "MCX_FO"),
-        ("GOLD", Market.MCX, "MCX_FO"),
-        ("SILVER", Market.MCX, "MCX_FO"),
-    ):
-        try:
-            found = upcoming_futures(mapper, underlying, limit=1)
-        except Exception:
-            found = []
-        if not found:
-            continue
-        ns, tok, inst = found[0]
-        out.append(WatchItem(
-            label=inst.symbol, namespace=ns, token=tok, symbol=inst.symbol,
-            market=mkt, segment=seg, tick=_tick_for_watch(inst, mkt),
-            expiry=inst.expiry,
-        ))
-    return out
+    from orderflow.watchlist import desk_watchlist
+
+    return [
+        WatchItem(
+            label=w.label, namespace=w.namespace, token=w.token, symbol=w.symbol,
+            market=w.market, segment=w.segment, tick=w.tick, expiry=w.expiry,
+        )
+        for w in desk_watchlist(mapper)
+    ]
 
 
 def load_dashboard(master_path: str = "instruments.json") -> FastAPI:

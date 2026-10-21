@@ -32,6 +32,57 @@ def _abnf():
     return _ABNF
 
 
+class RecordingTransport:
+    """Tees every received frame to a recorder, then delegates.
+
+    Records the connection's raw stream rather than per-instrument trades. That
+    is deliberate: a frame does not announce which instrument it belongs to
+    until it is decoded, and the decoder already exists on the replay side. So
+    the recorder stores exactly what the socket delivered, and replay routes it
+    through the same router as a live session. Nothing is interpreted twice, and
+    a decoder fix retroactively applies to every recording ever taken.
+
+    `recv` is the only method that records. Sending a subscription is not
+    market data, and replaying it would only confuse the replay transport.
+    """
+
+    def __init__(self, inner, recorder, key: str, clock=None) -> None:
+        self._inner = inner
+        self._recorder = recorder
+        self._key = key
+        self._clock = clock
+        self.recorded = 0
+
+    def __getattr__(self, name):
+        # is_live, send, heartbeat, close and anything else pass through. The
+        # connector checks `is_live` on the transport, so this must be the
+        # inner value and not the wrapper's.
+        return getattr(self._inner, name)
+
+    def connect(self) -> None:
+        self._inner.connect()
+
+    def send(self, data, binary: bool = False) -> None:
+        self._inner.send(data, binary=binary)
+
+    def recv(self, timeout: float | None = None):
+        frame = self._inner.recv(timeout=timeout)
+        if frame is not None:
+            ts = self._clock() if self._clock is not None else None
+            try:
+                self._recorder.write(self._key, frame, ts=ts)
+                self.recorded += 1
+            except Exception:
+                # A full disk must not kill the feed. Losing the recording is
+                # bad; losing the live session is worse, and the caller can see
+                # the frame count stop advancing.
+                pass
+        return frame
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 class WebSocketTransport:
     """A real SmartStream socket, using `websocket-client` if present.
 
@@ -142,6 +193,71 @@ class WebSocketTransport:
                 self._ws.close()
             finally:
                 self._ws = None
+
+
+class ShardTransport:
+    """Replays `.oft.gz` shards written by `orderflow.recorder`.
+
+    This is the live-backtest transport: it hands the same frames to the same
+    connector, router and session chart that a live socket feeds, so a replay
+    exercises the real pipeline rather than a parallel one. No trades are
+    injected below this point.
+
+    One instance replays one instrument's shards in timestamp order. Shards are
+    ordered by their filename, which is the hour stamp, so a month of files
+    replays chronologically without reading them all into memory first.
+    """
+
+    is_live = False
+
+    def __init__(self, root: str | Path, key: str | None = None,
+                 shards: Iterable[str | Path] | None = None) -> None:
+        from ..recorder import iter_shards
+
+        self.root = Path(root)
+        self.key = key
+        if shards is not None:
+            self._paths = [Path(s) for s in shards]
+        else:
+            self._paths = list(iter_shards(self.root, key))
+        self._records = []
+        self._i = 0
+        self.sent: list[bytes] = []
+        self.heartbeats = 0
+        self.shards_read = 0
+        self.torn_shards: list[str] = []
+
+    def connect(self) -> None:
+        from ..recorder import read_shard
+
+        self._records = []
+        for path in self._paths:
+            try:
+                self._records.extend(read_shard(path))
+                self.shards_read += 1
+            except Exception:
+                # One unreadable shard must not stop a month-long replay.
+                self.torn_shards.append(str(path))
+        self._i = 0
+
+    def send(self, data: bytes | str, binary: bool = False) -> None:
+        self.sent.append(data if isinstance(data, bytes) else data.encode("utf-8"))
+
+    def heartbeat(self) -> None:
+        self.heartbeats += 1
+
+    def recv(self, timeout: float | None = None):
+        from ..recorder import TYPE_TEXT
+
+        if self._i >= len(self._records):
+            return None
+        rec = self._records[self._i]
+        self._i += 1
+        return rec.payload.decode("utf-8", "replace") if rec.type == TYPE_TEXT else rec.payload
+
+    def close(self) -> None:
+        self._records = []
+        self._i = 0
 
 
 class FileTransport:
