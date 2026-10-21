@@ -285,6 +285,15 @@ class TestAlwaysOnFeed:
     def _calendar(self):
         return MarketCalendar(Market.NSE, segment="NSE_FNO")
 
+    #: A moment NSE F&O is open on a Wednesday, so a test that pins its clock
+    #: here is not at the mercy of when the suite happens to run. The two tests
+    #: below drive a fake connector that calls `stop()` on its first run, which
+    #: can only happen if the supervisor believes the market is open.
+    OPEN_AT = datetime(2026, 10, 21, 11, 0, tzinfo=IST).timestamp()
+
+    def _open_clock(self):
+        return lambda: self.OPEN_AT
+
     def test_stop_is_the_only_way_out(self):
         from orderflow.supervisor import AlwaysOnFeed
 
@@ -296,7 +305,8 @@ class TestAlwaysOnFeed:
                 feed.stop()
                 return type("S", (), {"frames": 0, "reconnects": 0})()
 
-        feed = AlwaysOnFeed(self._calendar(), lambda: FakeConn())
+        feed = AlwaysOnFeed(self._calendar(), lambda: FakeConn(),
+                            clock=self._open_clock())
         feed.run()  # must return only because the fake called stop()
         assert calls["n"] == 1
         assert feed.health.stopped
@@ -314,7 +324,8 @@ class TestAlwaysOnFeed:
                 raise RuntimeError("boom")
 
         cfg = SupervisorConfig(backoff_min=0.0, backoff_max=0.0)
-        feed = AlwaysOnFeed(self._calendar(), lambda: FlakyConn(), cfg)
+        feed = AlwaysOnFeed(self._calendar(), lambda: FlakyConn(), cfg,
+                            clock=self._open_clock(), sleep=lambda s: None)
         feed.run()
         assert calls["n"] >= 3, "the supervisor must keep trying after a failure"
 
