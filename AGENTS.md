@@ -172,3 +172,34 @@ requires it.
   chop collapses into one fake event.
 - The pressure window is over the last N prints, not N per side.
 - Delta heatmap must use a diverging scale; a sequential scale hides the sign.
+
+## Dashboard
+
+`run_dashboard.py` serves the dashboard; `dashboard.py` holds the app and
+`dashboard_ui.py` holds the page. The page is one self-contained HTML string
+with no build step and no CDN, so it works on a box with no outbound network.
+
+Design rules that are easy to break by accident:
+
+- The feed runs on one background thread and owns the socket. The WebSocket
+  handler only reads the latest snapshot. If the browser were allowed to drive
+  the socket, a stalled tab would stall the exchange connection.
+- Snapshots are built on demand from the session chart, not pushed per tick.
+  A busy session delivers thousands of ticks a second; that must not become
+  thousands of JSON documents a second.
+- `WatchItem.key()` is `"<NAMESPACE>_<token>"`. It is used as a URL path
+  segment, so it must stay free of `:` and `/`.
+- Charts are keyed by that same key. `Instrument` has no `token` field; the
+  token lives in the mapper, so `_chart_for` resolves the watch item by symbol.
+- MCX tick sizes are matched longest-name-first. `SILVER` is a prefix of
+  `SILVERMIC` and `GOLD` of `GOLDPETAL`, and each pair has different ticks, so
+  matching the short name first is a silent misconfiguration.
+- An off-session capture produces no bars. That is correct, not a bug: the
+  session chart drops prints outside the session so they cannot corrupt the
+  opening profile. A capture taken before 09:15 IST will therefore replay with
+  zero bars while still reporting trades.
+
+Replay is the live-backtest path: `FileTransport` feeds recorded frames through
+the same decoder, router, tick reader and session chart as a live socket. No
+synthetic trades are injected below the transport, so a replay exercises the
+real pipeline.

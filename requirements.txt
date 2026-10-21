@@ -1,0 +1,13 @@
+# The engine itself is standard library only. These are for the dashboard.
+#
+# websocket-client is used by the live transport; it is the only third-party
+# package the feed path needs.
+websocket-client>=1.7
+
+# Dashboard (optional; the CLI works without these).
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27          # only for fastapi.testclient in the test suite
+
+# Test suite.
+pytest>=8.0
