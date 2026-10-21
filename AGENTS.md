@@ -246,6 +246,10 @@ Invariants that took a bug each to learn:
   `ANGEL_CLIENT_CODE`, `ANGEL_PIN`, `ANGEL_TOTP_SECRET`. Never from arguments,
   never written to disk, never committed.
 
+- `record_ticks.py` waits for the session open by default and logs in only
+  after the wait, because a JWT minted before the open has aged past its hour
+  by the time the session starts. Credentials are read *before* the wait so a
+  missing variable fails in a second instead of two hours later.
 - `record_ticks.py --rehearse SECONDS` drives the whole capture path on
   scripted frames, with no socket and no credentials. `RehearsalTransport` is
   `is_live = True` so the connector takes the live control flow, then drops out
