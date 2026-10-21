@@ -310,6 +310,16 @@ Invariants that took a bug each to learn:
   at most the first print's size at a true session open; not skipping destroys
   the bar on any mid-session attach. `state.has_baseline` records that the
   baseline was taken.
+- **A small backward move in the day's cumulative volume is a stale snapshot,
+  not a session reset.** The feed interleaves tokens and the exchange re-sends
+  snapshots, so `volume_trade_for_the_day` can drop by a few hundred contracts
+  and then recover. The old code treated every backward move as a rollover and
+  booked the entire cumulative total as one print: on a real capture that put
+  **2,152,670 contracts** into a single NIFTY bar whose median print is 22, and
+  those phantom prints then drove bogus SELL entries. Only a drop that loses
+  more than half the accumulated volume is a real rollover; anything smaller
+  emits nothing and keeps the high-water mark, so the next fresh tick measures
+  from the right base. 32 of these fired in a 25-minute capture.
 - `record_ticks.py` exits non-zero when it recorded nothing. An accepted
   subscription outside its session streams silence, indistinguishable from a
   quiet market.

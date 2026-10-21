@@ -279,6 +279,24 @@ class TestTickReaderVolumeDifferencing:
         assert after.trade.size == 50.0  # the new absolute value
         assert r.state.volume_resets == 1
 
+    def test_a_stale_snapshot_is_not_a_session_reset(self):
+        """A slightly stale snapshot must not be booked as a huge print.
+
+        The live feed interleaves tokens and the exchange re-sends snapshots,
+        so the day's cumulative volume can move backwards by a small amount.
+        Booking the whole cumulative total as one print (the old behaviour) put
+        2,152,670 contracts into a single NIFTY bar whose median print is 22.
+        """
+        r = TickReader("26000")
+        r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1737515))))
+        # A stale snapshot 390 contracts behind: same session, no reset.
+        stale = r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1737125))))
+        assert stale is None, "a stale snapshot is not a trade"
+        assert r.state.volume_resets == 0
+        # The next fresh tick still measures from the high-water mark.
+        nxt = r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=1737605))))
+        assert nxt.trade.size == 90.0
+
     def test_price_is_unscaled(self):
         r = TickReader("26000")
         r.read(decode_packet(encode_tick(snap_spec(volume_trade_for_the_day=0))))

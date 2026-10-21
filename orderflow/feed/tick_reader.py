@@ -187,10 +187,21 @@ class TickReader:
             return None
 
         if cumulative < state.last_volume:
-            # Session rollover or feed restart: treat the new value as the first
-            # increment rather than a negative one.
-            state.volume_resets += 1
-            increment = cumulative
+            # A backward move in the day's cumulative volume is usually a stale
+            # snapshot arriving out of order, not a session rollover: the feed
+            # interleaves tokens and the exchange re-sends snapshots. Treating
+            # every backward move as a reset booked the whole cumulative total
+            # as one print, which put 2,152,670 contracts into a single NIFTY
+            # bar whose median print is 22. Only a drop that loses most of the
+            # accumulated volume is a real rollover.
+            if state.last_volume - cumulative > state.last_volume * 0.5:
+                state.volume_resets += 1
+                increment = cumulative
+            else:
+                # Stale snapshot: no contract changed hands. Keep the
+                # high-water mark so the next fresh tick measures from the
+                # right base, and emit nothing.
+                return None
         else:
             increment = cumulative - state.last_volume
 
