@@ -345,6 +345,13 @@ python3 record_ticks.py --out ./recordings --dry-run
 python3 record_ticks.py --out ./recordings
 ```
 
+Started before the open, the recorder waits for the first session and logs in
+only then. That matters on the desk: a JWT minted at 07:00 has aged past its
+hour by the NSE open. MCX opens at 09:00 and NSE at 09:15, so the wait ends at
+the earlier of the two and MCX is captured from its first print. Credentials
+are checked before the wait, so a missing variable fails in a second rather
+than after an hour of waiting. `--no-wait-for-open` subscribes immediately.
+
 The recorder tees the raw socket stream, not per-instrument trades. A frame
 does not say which instrument it belongs to until it is decoded, and the
 decoder already exists on the replay side, so the shard stores exactly what the

@@ -161,6 +161,75 @@ class TestRehearsal:
         assert t.is_live is False
 
 
+class TestWaitForOpen:
+    """A recorder started at 07:00 must wait for the open, not subscribe into a
+    closed market. And the login must happen after the wait, because a JWT
+    minted at 07:00 has aged more than an hour by 09:00."""
+
+    def _specs(self):
+        return parse_instruments("NSE_FO:48704:0.05")
+
+    def test_returns_immediately_when_already_open(self):
+        specs = self._specs()
+        at = dt.datetime(2026, 10, 21, 10, 0, tzinfo=IST)
+        assert record_ticks._wait_for_open(
+            specs, at, {"flag": False}, sleep=lambda s: None,
+            clock=lambda: at) is True
+
+    def test_waits_until_the_open_then_returns(self):
+        specs = self._specs()
+        times = [dt.datetime(2026, 10, 21, 7, 0, tzinfo=IST)]
+
+        def clock():
+            return times[0]
+
+        def sleep(seconds):
+            # Jump the clock to the open rather than sleeping for two hours.
+            times[0] = dt.datetime(2026, 10, 21, 9, 15, tzinfo=IST)
+
+        assert record_ticks._wait_for_open(
+            specs, times[0], {"flag": False}, sleep=sleep, clock=clock) is True
+
+    def test_cancellation_before_the_open_reports_false(self):
+        specs = self._specs()
+        at = dt.datetime(2026, 10, 21, 7, 0, tzinfo=IST)
+        stopped = {"flag": False}
+
+        def sleep(seconds):
+            stopped["flag"] = True  # Ctrl-C arrives during the wait
+
+        assert record_ticks._wait_for_open(
+            specs, at, stopped, sleep=sleep, clock=lambda: at) is False
+
+    def test_mcx_opens_before_nse(self, capsys):
+        """The desk list spans both markets; the wait must end at the earlier
+        open, not the NSE one, or MCX loses the first fifteen minutes."""
+        specs = parse_instruments("NSE_FO:48704:0.05,MCX_FO:495213:1.0")
+        at = dt.datetime(2026, 10, 21, 7, 0, tzinfo=IST)
+        stopped = {"flag": False}
+
+        def sleep(seconds):
+            stopped["flag"] = True  # cancel after the target is printed
+
+        record_ticks._wait_for_open(specs, at, stopped,
+                                    sleep=sleep, clock=lambda: at)
+        out = capsys.readouterr().out
+        assert "09:00:00 IST" in out, out
+        assert "09:15:00 IST" not in out, out
+
+    def test_nse_only_waits_for_its_own_open(self, capsys):
+        specs = parse_instruments("NSE_FO:48704:0.05")
+        at = dt.datetime(2026, 10, 21, 7, 0, tzinfo=IST)
+        stopped = {"flag": False}
+
+        def sleep(seconds):
+            stopped["flag"] = True
+
+        record_ticks._wait_for_open(specs, at, stopped,
+                                    sleep=sleep, clock=lambda: at)
+        assert "09:15:00 IST" in capsys.readouterr().out
+
+
 class TestReplayMapper:
     def test_registers_every_token(self):
         specs = parse_instruments("NSE_FO:48704:0.05,MCX_FO:495213:1.0")

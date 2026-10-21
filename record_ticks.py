@@ -124,6 +124,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-finalize", action="store_true",
                     help="skip promoting .part files left by a crash")
     ap.add_argument("--max-reconnects", type=int, default=50)
+    ap.add_argument("--no-wait-for-open", action="store_true",
+                    help="subscribe immediately instead of waiting for the "
+                         "first session to open")
     args = ap.parse_args(argv)
 
     now = datetime.now(IST)
@@ -194,12 +197,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.rehearse is not None:
         return _rehearse(args, specs, mapper, plan, mode, now)
 
-    # ------------------------------------------------------------------ login
+    # ------------------------------------------------------------- stop flags
+    # Installed before the wait so Ctrl-C cancels a pre-open wait as cleanly as
+    # it stops a live session.
+    stopped = {"flag": False}
+
+    def _stop(signum, frame):
+        stopped["flag"] = True
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    # ------------------------------------------------------------- credentials
+    # Read the environment before the wait so a missing variable fails in a
+    # second rather than after two hours of waiting for the open. The login
+    # itself stays after the wait: a JWT minted at 07:00 has aged more than an
+    # hour by 09:00 and the feed token may have expired with it.
     try:
         creds = credentials_from_env()
     except CredentialError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    # ------------------------------------------------------- wait for the open
+    if not args.no_wait_for_open and not open_now:
+        # Started before the open, as a scheduler will. Waiting here captures
+        # the session from its first print instead of from whenever the operator
+        # got round to it.
+        if not _wait_for_open(specs, now, stopped):
+            print("cancelled before the open; nothing was recorded")
+            return 1
+        print(f"market open at {datetime.now(IST).strftime('%H:%M:%S IST')}, "
+              f"logging in\n")
+
+    # ------------------------------------------------------------------ login
     try:
         auth = login(creds)
     except Exception as exc:
@@ -218,13 +249,6 @@ def main(argv: list[str] | None = None) -> int:
     # One key per connection: frames arrive interleaved on a socket and cannot
     # be attributed to an instrument before decoding, so a per-socket shard is
     # the only honest split. Replay routes them exactly as the live path does.
-    stopped = {"flag": False}
-
-    def _stop(signum, frame):
-        stopped["flag"] = True
-
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
 
     def factory(index: int):
         ws = WebSocketTransport(
@@ -423,6 +447,35 @@ def _session_start_for(spec: WatchSpec, now: datetime) -> datetime:
         return window.close_at - timedelta(minutes=5)
     return window.open_at
 
+
+
+def _wait_for_open(specs, now: datetime, stopped: dict,
+                   sleep=time.sleep, clock=None) -> bool:
+    """Block until the first of `specs` opens. False if cancelled first.
+
+    Returns immediately if a session is already open. `sleep` and `clock` are
+    injectable so a test can drive the wait without a real one.
+    """
+    clock = clock or (lambda: datetime.now(IST))
+    if any(MarketCalendar(s.market, segment=s.segment).is_open(clock())
+           for s in specs):
+        return True
+    wait_until = min(
+        MarketCalendar(s.market, segment=s.segment).next_open(clock())
+        for s in specs
+    )
+    secs = (wait_until - clock()).total_seconds()
+    if secs <= 0:
+        return True
+    print(f"waiting until {wait_until.strftime('%H:%M:%S IST')} "
+          f"({secs/60:.1f} min) for the first session to open")
+    print("press Ctrl-C to cancel\n")
+    while not stopped["flag"]:
+        remaining = (wait_until - clock()).total_seconds()
+        if remaining <= 0:
+            return True
+        sleep(min(1.0, remaining))
+    return False
 
 
 def _mapper_for_tokens(specs):
