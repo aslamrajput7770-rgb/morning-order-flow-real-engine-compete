@@ -254,6 +254,11 @@ Invariants that took a bug each to learn:
 - `record_ticks.py` exits non-zero when it recorded nothing. An accepted
   subscription outside its session streams silence, indistinguishable from a
   quiet market.
+- The dashboard replay accepts a directory of shards, a single `.oft.gz` shard,
+  or a legacy line-format file, chosen by what the path is. Anything ending
+  `.oft.gz` must go to `ShardTransport`: `FileTransport` utf-8 decodes its
+  input, so feeding it a gzip shard reports a decode error rather than
+  replaying.
 - Credentials come from the environment only: `ANGEL_API_KEY`,
   `ANGEL_CLIENT_CODE`, `ANGEL_PIN`, `ANGEL_TOTP_SECRET`. Never from arguments,
   never written to disk, never committed.
