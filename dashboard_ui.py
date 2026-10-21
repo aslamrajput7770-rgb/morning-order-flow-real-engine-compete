@@ -72,20 +72,29 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .hint{color:var(--dim);padding:10px;line-height:1.6}
   .dbar{height:9px;background:#1a2130;border-radius:2px;overflow:hidden}
   .dbar i{display:block;height:100%}
+  .pill{padding:2px 8px;border-radius:10px;border:1px solid var(--line);
+        font-size:11px;color:var(--dim)}
+  .pill.on{border-color:#12657f;color:#9fe8ff;background:#0d2531}
+  .pill.off{border-color:#4a2530;color:#ff9a9a;background:#2a1418}
+  .pos{color:var(--buy)} .neg{color:var(--sell)}
+  details summary{cursor:pointer;color:var(--dim);padding:2px 0}
+  input[type=text]{background:var(--panel2);border:1px solid var(--line);
+        color:var(--txt);padding:4px 7px;border-radius:4px;font:inherit;width:230px}
 </style>
 </head>
 <body>
 <header>
   <h1>Order Flow Engine</h1>
-  <span class="stat"><span id="dot" class="dot"></span><b id="status">idle</b></span>
+  <span class="stat"><span id="dot" class="dot"></span><b id="status">starting</b></span>
   <span class="stat">ticks <b id="ticks">0</b></span>
   <span class="stat">trades <b id="trades">0</b></span>
   <span class="stat">src <b id="src">-</b></span>
   <span class="stat">last tick <b id="last">-</b></span>
+  <span class="stat">feed <b id="feedState">-</b></span>
+  <span class="stat">paper <span id="paperPill" class="pill off">off</span></span>
   <span style="margin-left:auto"></span>
-  <button id="btnStart" class="primary">Start live</button>
-  <button id="btnReplay">Replay capture</button>
-  <button id="btnStop">Stop</button>
+  <label class="stat"><input type="checkbox" id="paperToggle" checked> auto-trade</label>
+  <button id="btnPause">Pause feed</button>
 </header>
 
 <main>
@@ -94,9 +103,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="tabs" id="tabs"></div>
     <div id="err" class="err" style="display:none"></div>
     <div class="scroll" id="fp"></div>
+    <details style="padding:6px 10px">
+      <summary>validate on a capture (backtest)</summary>
+      <div style="display:flex;gap:6px;padding:6px 0">
+        <input type="text" id="replayPath" value="recordings" placeholder="capture dir or .oft.gz file">
+        <button id="btnReplay">Replay</button>
+      </div>
+    </details>
   </section>
 
   <div style="display:flex;flex-direction:column;gap:10px">
+    <section class="panel">
+      <h2><span>Paper account</span><span id="paperMeta" class="stat"></span></h2>
+      <div class="kv" id="paper"></div>
+    </section>
+    <section class="panel">
+      <h2><span>Open positions</span></h2>
+      <div class="scroll" style="max-height:22vh"><table id="positions"></table></div>
+    </section>
+    <section class="panel">
+      <h2><span>Closed trades</span></h2>
+      <div class="scroll" style="max-height:22vh"><table id="trades-log"></table></div>
+    </section>
     <section class="panel">
       <h2><span>Cumulative delta</span><span id="cumMeta" class="stat"></span></h2>
       <canvas id="cum" height="150"></canvas>
@@ -257,6 +285,47 @@ function renderSession(chart){
     `<div>${k}</div><div>${v}</div>`).join("");
 }
 
+function renderPaper(p){
+  const acct = p || {};
+  const cls = v => v===null||v===undefined ? "" : (v>=0 ? "pos" : "neg");
+  const rows = [
+    ["equity", int(acct.equity), ""],
+    ["net PnL", int(acct.net_pnl), cls(acct.net_pnl)],
+    ["realized", int(acct.realized_pnl), cls(acct.realized_pnl)],
+    ["unrealized", int(acct.unrealized_pnl), cls(acct.unrealized_pnl)],
+    ["costs", int(acct.costs), "neg"],
+    ["entries", int(acct.entries), ""],
+    ["exits", int(acct.exits), ""],
+  ];
+  $("paper").innerHTML = rows.map(([k,v,c])=>
+    `<div>${k}</div><div class="${c}">${v}</div>`).join("");
+
+  const pos = acct.positions || [];
+  const head = "<tr><th>symbol</th><th>qty</th><th>avg</th><th>last</th>"
+             + "<th>stop</th><th>target</th><th>uPnL</th></tr>";
+  $("positions").innerHTML = head + (pos.length ? pos.map(p=>
+    `<tr><td class="px">${p.symbol}</td><td>${int(p.qty)}</td>`
+    + `<td>${fmt(p.avg_price)}</td><td>${fmt(p.last_price)}</td>`
+    + `<td>${fmt(p.stop)}</td><td>${fmt(p.target)}</td>`
+    + `<td class="${cls(p.unrealized)}">${int(p.unrealized)}</td></tr>`
+  ).join("") : '<tr><td colspan="7" style="text-align:center;color:var(--dim)">'
+      + 'no open positions</td></tr>');
+
+  const rt = (acct.round_trips || []).slice().reverse();
+  const rhead = "<tr><th>symbol</th><th>side</th><th>qty</th><th>entry</th>"
+              + "<th>exit</th><th>gross</th><th>costs</th><th>net</th></tr>";
+  $("trades-log").innerHTML = rhead + (rt.length ? rt.map(r=>
+    `<tr><td class="px">${r.symbol}</td>`
+    + `<td class="${r.side==="BUY"?"ask":"bid"}">${r.side}</td>`
+    + `<td>${int(r.qty)}</td><td>${fmt(r.entry_price)}</td>`
+    + `<td>${fmt(r.exit_price)}</td>`
+    + `<td class="${cls(r.gross)}">${int(r.gross)}</td>`
+    + `<td class="neg">${int(r.costs)}</td>`
+    + `<td class="${cls(r.net)}">${int(r.net)}</td></tr>`
+  ).join("") : '<tr><td colspan="8" style="text-align:center;color:var(--dim)">'
+      + 'no closed trades yet</td></tr>');
+}
+
 let WATCH = [];
 async function tick(){
   try{
@@ -266,6 +335,7 @@ async function tick(){
     $("ticks").textContent = s.ticks;
     $("trades").textContent = s.trades;
     $("src").textContent = s.source;
+    $("feedState").textContent = s.running ? s.status : "paused";
     $("last").textContent = s.last_tick_at
       ? new Date(s.last_tick_at*1000).toLocaleTimeString() : "-";
     $("status").textContent = s.status;
@@ -274,6 +344,15 @@ async function tick(){
                   : s.status==="error" ? " err" : "");
     if(s.last_error){ $("err").style.display="block"; $("err").textContent = s.last_error; }
     else $("err").style.display="none";
+
+    // Paper trading is on by default and the engine trades on its own; the
+    // page only reports what it did. There is no per-trade button by design.
+    const paperOn = s.paper !== null && s.paper !== undefined;
+    const pill = $("paperPill");
+    pill.textContent = paperOn ? "on" : "off";
+    pill.className = "pill " + (paperOn ? "on" : "off");
+    $("paperToggle").checked = paperOn;
+    renderPaper(s.paper);
 
     if(SEL){
       const cr = await fetch(`/api/chart/${encodeURIComponent(SEL)}`);
@@ -294,25 +373,18 @@ async function post(url, body){
     body: JSON.stringify(body||{})});
   return r.json();
 }
-$("btnStart").onclick = async () => {
-  // Credentials live on the server. Ask for a recording path here, because a
-  // session that is not recorded cannot be replayed later. Blank keeps the
-  // server's default directory, which is still a recording.
-  const rec = prompt(
-    "Record this session to (blank uses the server default):", "recordings");
-  const body = {mode:"live"};
-  body.record = rec || "";
-  const r = await post("/api/feed/start", body);
-  if(r.detail) alert(r.detail);
+$("btnPause").onclick = () => post("/api/feed/stop", {});
+$("paperToggle").onchange = async (e) => {
+  await post("/api/paper", {enabled: e.target.checked});
 };
 $("btnReplay").onclick = async () => {
-  const path = prompt(
-    "Recording directory or capture file to replay:", "recordings");
+  // A capture is the only honest way to check the engine without risking a
+  // live session: it drives the identical decision code over real prints.
+  const path = $("replayPath").value.trim();
   if(!path) return;
   const r = await post("/api/feed/start", {mode:"replay", path});
   if(r.detail) alert(r.detail);
 };
-$("btnStop").onclick = () => post("/api/feed/stop", {});
 </script>
 </body>
 </html>

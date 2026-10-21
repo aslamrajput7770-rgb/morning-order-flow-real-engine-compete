@@ -3,15 +3,20 @@
     python3 run_dashboard.py --port 12000
 
 Serves the dashboard on 0.0.0.0 so it is reachable from outside the sandbox.
-The feed is started from the page, not at boot: a socket opened at import time
-would burn the login and start streaming before anyone was watching.
+
+The feed starts at boot and stays up. That is the point: the desk asked for an
+engine that analyses and trades on its own, not one that waits for someone to
+click Start. The only button on the page pauses the feed; there is no "start",
+because a feed that is meant to always be running does not have a start.
+
+With credentials in the environment the feed comes up live and records, and the
+paper trader works the tape automatically. Without them the page still loads,
+instrument search works, and the capture replay is available, but there is no
+live session to run.
 
 Live mode needs the same four environment variables as `live_feed.py`:
 
     ANGEL_API_KEY  ANGEL_CLIENT_CODE  ANGEL_PIN  ANGEL_TOTP_SECRET
-
-Without them the page still loads, the instrument search works, and the replay
-button works. Only "Start live" needs credentials.
 """
 
 from __future__ import annotations
@@ -68,6 +73,10 @@ def main(argv=None) -> int:
     if not args.no_default_watchlist:
         items = default_watchlist(mapper)
         app.state.watchlist.extend(items)
+        # The paper trader was built before the watchlist was seeded, so tell it
+        # about the instruments now. A run re-syncs anyway, but registering here
+        # keeps the account meaningful even before the first run.
+        app.state.runner.sync_paper_watchlist()
         for w in items:
             print(f"  watch {w.label:28} {w.market.value:5} "
                   f"token={w.token} tick={w.tick} exp={w.expiry}")

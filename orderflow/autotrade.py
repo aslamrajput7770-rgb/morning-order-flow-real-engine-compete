@@ -69,6 +69,11 @@ class AutoTraderConfig:
     #: Stop and target in ticks, overriding the strategy's defaults when set.
     stop_ticks: int | None = None
     target_ticks: int | None = None
+    #: Bar length. Declared here rather than set on the instance because this
+    #: dataclass uses slots: an undeclared attribute would raise.
+    bar_seconds: float = 300.0
+    #: Starting paper cash, per instrument. Used by the broker factory.
+    cash: float = 1_000_000.0
 
 
 class AutoTrader:
@@ -238,9 +243,12 @@ class AutoTrader:
 
     # ------------------------------------------------------------------- views
     def all_positions(self) -> list[dict]:
+        """Open positions only. A flat instrument is not a position."""
         out: list[dict] = []
         for state in self.instruments.values():
             pos = state.broker.positions[state.symbol]
+            if pos.is_flat:
+                continue
             out.append({
                 "symbol": state.symbol,
                 "qty": pos.qty,

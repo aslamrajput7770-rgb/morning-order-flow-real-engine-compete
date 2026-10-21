@@ -8,10 +8,15 @@ Pure-Python order-flow / footprint analytics engine. Stdlib only at runtime;
 ## Commands
 
 ```bash
-python3 -m pytest tests -q    # 184 tests, no mocks, no network
+python3 -m pytest tests -q    # 374 tests, no mocks, no network
 python3 demo.py               # engine tour; writes footprint.html
 python3 demo_indian.py        # NSE + MCX sessions, reset, token map
 python3 demo_feed.py          # SmartStream ingestion, offline, simulated bytes
+
+# Always-on autonomous paper trading (the desk's main entry point):
+python3 run_trader.py                   # feed + strategy + paper broker, runs forever
+python3 run_trader.py --replay recordings/  # same decision loop over a capture
+python3 run_dashboard.py --port 12000   # dashboard; feed + paper trading start at boot
 
 # Live (needs credentials in the environment, never in code or chat):
 export ANGEL_API_KEY=... ANGEL_CLIENT_CODE=... ANGEL_PIN=... ANGEL_TOTP_SECRET=...
@@ -173,6 +178,44 @@ requires it.
 - The pressure window is over the last N prints, not N per side.
 - Delta heatmap must use a diverging scale; a sequential scale hides the sign.
 
+## Trading layer (strategy -> paper -> auto-trader)
+
+Four modules sit on top of the analytics. Each is pure and testable without a
+socket; only `supervisor.py` touches the clock and the network.
+
+- `orderflow/strategy.py` — `SignalEngine.evaluate(bars, grid, symbol, trades)`
+  composes delta, footprint imbalances, absorption, VWAP and divergence into a
+  scored entry with stated reasons. It refuses to confirm on delta when the
+  unknown-aggressor fraction exceeds `max_unknown_frac` (0.40): an unknown side
+  is split 50/50 by the engine, so a delta built mostly from unknowns is a
+  guess, not evidence. Stop and target are ATR-sized (`stop_atr_mult=1.5`,
+  `target_atr_mult=3.0`), never a fixed number of ticks.
+- `orderflow/paper.py` — `PaperBroker` with an Indian cost model (brokerage,
+  STT, exchange, GST, stamp) plus slippage. `register(symbol, lot_size,
+  tick_size)` per instrument.
+- `orderflow/autotrade.py` — `AutoTrader` decides on bar completion, not per
+  tick, and manages stop/target. `AutoTraderConfig` is a plain mutable config;
+  it must stay mutable so callers can override one knob (a frozen config made
+  `--stop-atr-mult` silently do nothing).
+- `orderflow/supervisor.py` — `AlwaysOnFeed` survives session ends, token
+  expiry and socket drops. Its sleep is injected, so a fake clock can test the
+  wait loop without a real `Event.wait` (a real wait hung the tests).
+
+Bugs that each cost a debugging session, recorded so they are not reintroduced:
+
+- **Limit fills must respect the limit.** A limit BUY at 99.0 was filling at
+  99.05 because the crossing test compared the wrong way. A limit BUY fills
+  only when the market price is `<= order.price`; a limit SELL only when it is
+  `>= order.price`.
+- **Entry at the current print, not the prior bar close.** Taking `signal.price`
+  (the last bar's close) let the entry use a price that had already traded away,
+  which is look-ahead. The entry price is the print that triggered the signal.
+- **`all_positions()` returns open positions only.** Including flat
+  instruments made the dashboard show phantom rows with `stop=None`.
+- **Paper state is per run.** The trader is rebuilt on every run start, like the
+  charts. A trader reused across runs stacked a second replay's prints onto the
+  first run's book.
+
 ## Dashboard
 
 `run_dashboard.py` serves the dashboard; `dashboard.py` holds the app and
@@ -181,6 +224,22 @@ with no build step and no CDN, so it works on a box with no outbound network.
 
 Design rules that are easy to break by accident:
 
+- **The feed is always on.** `run_dashboard.py` starts the live feed at boot via
+  the app's lifespan and leaves it up; the only control on the page pauses it.
+  There is no "Start live" button, because a feed meant to run unattended does
+  not have a start. Autostart is on the lifespan, not at import, so building the
+  app in a test never opens a socket.
+- **Paper trading is on by default** and trades on its own from the live tape.
+  There is no per-trade button by design. `POST /api/paper {"enabled": false}`
+  turns it off; the header checkbox drives that. The page only reports what the
+  engine did — positions, PnL, closed trades — it never decides.
+- **The trader is rebuilt on every run start** (`_launch` -> `enable_paper`),
+  and the watchlist is re-registered then too, because the page can edit it and
+  the default watchlist is seeded after `build_app`.
+- **Live counters are mirrored from the connector inside `on_trade`.** The
+  connector's stats are only returned when `run` ends, and an always-on feed
+  never ends, so reading them after `run` would leave `frames`/`ticks` frozen
+  at zero forever.
 - The feed runs on one background thread and owns the socket. The WebSocket
   handler only reads the latest snapshot. If the browser were allowed to drive
   the socket, a stalled tab would stall the exchange connection.

@@ -25,6 +25,7 @@ import json
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -64,6 +65,10 @@ class WatchItem:
     segment: str
     tick: float
     expiry: str | None = None
+    #: Contract size. Required for a correct paper PnL: without it every fill
+    #: is one unit and the rupee number is meaningless. Defaults to 1 so a
+    #: caller that does not know it still gets a coherent (if unscaled) result.
+    lot_size: int = 1
 
     def key(self) -> str:
         # Path-safe: this string is used as a URL segment.
@@ -130,6 +135,79 @@ class FeedRunner:
         self._stop = threading.Event()
         self._conn: SmartStreamConnector | None = None
         self._recorder = None
+        # Paper trading is off unless a caller enables it. When on, every routed
+        # trade is fed to the auto-trader as well as to the chart, so the same
+        # prints drive both the display and the decisions.
+        self.trader = None
+        self.paper_config = None
+        self.paper_enabled = False
+        self._paper_bar_seconds = 300.0
+
+    # ----------------------------------------------------------- paper trading
+    def enable_paper(self, config=None, bar_seconds: float = 300.0) -> None:
+        """Turn on autonomous paper trading for the current watchlist."""
+        from orderflow.autotrade import AutoTrader, AutoTraderConfig
+        from orderflow.paper import CostModel, PaperBroker
+
+        cfg = config or AutoTraderConfig()
+        cfg.bar_seconds = bar_seconds
+        self.paper_enabled = True
+        self._paper_bar_seconds = bar_seconds
+
+        def calendar_for(symbol, market, segment=None):
+            return MarketCalendar(market, segment=segment or (
+                "MCX_FO" if market is Market.MCX else "NSE_FNO"))
+
+        def broker_factory():
+            return PaperBroker(cash=cfg.cash if hasattr(cfg, "cash") else 1_000_000.0,
+                               cost_model=CostModel())
+
+        self.trader = AutoTrader(
+            calendar_for, cfg, broker_factory=broker_factory,
+            bar_seconds=bar_seconds,
+        )
+        self.paper_config = cfg
+        self.sync_paper_watchlist()
+
+    def sync_paper_watchlist(self) -> None:
+        """Register the current watchlist with the paper trader.
+
+        Called at every run start, not only when paper is enabled: the watchlist
+        is seeded after `build_app` and can be edited from the page, so the
+        trader must pick up whatever is being streamed at the moment the feed
+        actually starts.
+        """
+        if self.trader is None:
+            return
+        for w in self.state.watchlist:
+            lot = w.lot_size
+            if lot <= 1:
+                # The watchlist may not carry a lot size. The master does, and
+                # the mapper was built from it, so ask there before falling back
+                # to one: a wrong lot size scales every rupee of PnL.
+                try:
+                    inst = self.mapper.by_token(w.namespace, w.token)
+                    lot = inst.lot_size
+                except Exception:
+                    lot = w.lot_size
+            self.trader.register(
+                w.symbol, w.market, tick_size=w.tick, lot_size=lot,
+            )
+
+    def _paper_on_trade(self, rt) -> None:
+        if self.trader is None:
+            return
+        inst = rt.instrument
+        symbol = getattr(inst, "symbol", "")
+        self.trader.on_trade(symbol, rt.trade)
+
+    def paper_snapshot(self) -> dict | None:
+        """The paper account, or None when paper trading is off."""
+        if self.trader is None:
+            return None
+        acct = self.trader.account()
+        acct["positions"] = self.trader.all_positions()
+        return acct
 
     # ------------------------------------------------------------------ live
     def start_live(self, session: dict, api_key: str, client_code: str,
@@ -215,6 +293,11 @@ class FeedRunner:
     def _launch(self, work, source: str) -> None:
         # A new run must not inherit the previous run's charts or counters.
         self.state.begin_run()
+        if self.paper_enabled:
+            # Rebuild the paper book for the new run: positions and PnL belong
+            # to one session, not to the process. This also re-reads the
+            # watchlist, which the page may have edited since the last run.
+            self.enable_paper(self.paper_config, self._paper_bar_seconds)
         with self.state.lock:
             self.state.running = True
             self.state.status = "starting"
@@ -236,8 +319,25 @@ class FeedRunner:
                 chart = self._chart_for(rt)
                 if chart is not None:
                     chart.add(rt.trade)
+                # Paper trading sees the same prints the chart does. It is fed
+                # after the chart so a trader exception cannot lose a bar.
+                if self.trader is not None:
+                    try:
+                        self._paper_on_trade(rt)
+                    except Exception as exc:  # noqa: BLE001
+                        with self.state.lock:
+                            self.state.last_error = f"paper trader: {exc}"
+                # The connector's counters are only returned when `run` ends,
+                # and an always-on feed never ends. Mirror them here so the
+                # header shows a live tick count instead of a frozen zero.
+                conn_stats = getattr(self._conn, "stats", None)
                 with self.state.lock:
                     self.state.trades += 1
+                    if conn_stats is not None:
+                        self.state.frames = conn_stats.frames
+                        self.state.ticks = conn_stats.ticks
+                        self.state.unmapped = conn_stats.unmapped
+                        self.state.protocol_errors = conn_stats.protocol_errors
                     self.state.last_tick_at = time.time()
 
             stats = self._conn.run(
@@ -435,13 +535,47 @@ def build_app(
     recording, and "Start live" says why it cannot proceed rather than opening
     a socket it has no token for.
     """
-    app = FastAPI(title="Order Flow Engine")
     state = DashboardState()
+    runner = FeedRunner(state, mapper)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        """Bring the live feed up at boot and leave it up.
+
+        Wired to the lifespan rather than import so a test that builds the app
+        does not open a socket. With no credentials there is nothing to start
+        and the page says so; a replay is still available.
+        """
+        if credentials and state.watchlist:
+            def boot():
+                try:
+                    session = _login(credentials)
+                    runner.start_live(
+                        session,
+                        credentials["api_key"], credentials["client_code"],
+                        session.get("feedToken", ""),
+                        record_dir,
+                    )
+                except Exception as exc:  # noqa: BLE001 - surfaced on the page
+                    with state.lock:
+                        state.last_error = f"autostart: {type(exc).__name__}: {exc}"
+                        state.status = "error"
+
+            threading.Thread(target=boot, name="orderflow-autostart",
+                             daemon=True).start()
+        yield
+        runner.stop()
+
+    app = FastAPI(title="Order Flow Engine", lifespan=lifespan)
     # The endpoints mutate `state.watchlist` directly. `app.state.watchlist` is
     # the same list object so the seeding in `load_dashboard` lands here.
     app.state.watchlist = state.watchlist
     app.state.dashboard = state
-    runner = FeedRunner(state, mapper)
+    app.state.runner = runner
+    # Paper trading is on by default: the desk asked for a feed that analyses
+    # and trades on its own, not one that waits to be started. It can be turned
+    # off with POST /api/paper {"enabled": false}.
+    runner.enable_paper()
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -465,6 +599,7 @@ def build_app(
                 "last_error": state.last_error,
                 "last_tick_at": state.last_tick_at,
                 "started_at": state.started_at,
+                "paper": runner.paper_snapshot(),
                 "watchlist": [
                     {
                         "key": w.key(), "label": w.label, "symbol": w.symbol,
@@ -579,6 +714,30 @@ def build_app(
         runner.stop()
         return {"ok": True}
 
+    @app.get("/api/paper")
+    def paper_get() -> dict:
+        return {
+            "enabled": runner.paper_enabled,
+            "account": runner.paper_snapshot(),
+        }
+
+    @app.post("/api/paper")
+    def paper_set(body: dict) -> dict:
+        """Turn autonomous paper trading on or off.
+
+        This is the one switch the desk asked for: on, the engine takes and
+        manages its own paper positions from the live tape; off, it only
+        analyses. There is no per-trade manual entry, by design.
+        """
+        enabled = bool(body.get("enabled", True))
+        if enabled:
+            bar_seconds = float(body.get("bar_seconds", 300.0))
+            runner.enable_paper(bar_seconds=bar_seconds)
+        else:
+            runner.paper_enabled = False
+            runner.trader = None
+        return {"ok": True, "enabled": runner.paper_enabled}
+
     @app.websocket("/ws")
     async def ws(sock: WebSocket) -> None:
         await sock.accept()
@@ -597,6 +756,7 @@ def build_app(
                     "ticks": ticks,
                     "trades": trades,
                     "error": err,
+                    "paper": runner.paper_snapshot(),
                     "charts": {k: chart_snapshot(state, k) for k in keys},
                 }
                 await sock.send_text(json.dumps(payload, default=str))
@@ -635,4 +795,8 @@ def load_dashboard(master_path: str = "instruments.json") -> FastAPI:
     # Seed the watchlist so the page is useful on first load.
     for item in default_watchlist(mapper):
         app.state.watchlist.append(item)
+    # The watchlist is seeded after build_app, so register it with the paper
+    # trader now. A later run re-syncs anyway, which also covers edits made
+    # from the page.
+    app.state.runner.sync_paper_watchlist()
     return app

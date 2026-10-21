@@ -162,6 +162,84 @@ def _in_session_capture(path: Path, n: int = 40) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+class TestAlwaysOnStartup:
+    """The feed is up at boot. There is no Start button to press."""
+
+    def test_feed_starts_at_boot_with_credentials(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import dashboard as dash
+        from orderflow.instrument_master import build_live_token_map
+
+        if not Path("instruments.json").exists():
+            pytest.skip("instruments.json not downloaded")
+
+        monkeypatch.setattr(dash, "_login", lambda creds: {
+            "jwtToken": "jwt", "feedToken": "feed"})
+        started = {}
+
+        def spy(self, session, api_key, client_code, feed_token,
+                record_path=None):
+            started.update(session=session, feed_token=feed_token,
+                           record_path=record_path)
+            # Return without opening a socket: the test only cares that the
+            # boot path reached start_live with the logged-in session.
+            raise RuntimeError("no socket in test")
+
+        monkeypatch.setattr(dash.FeedRunner, "start_live", spy)
+        mapper, _ = build_live_token_map("instruments.json")
+        app = dash.build_app(
+            mapper, "instruments.json",
+            credentials={"api_key": "k", "client_code": "c",
+                         "pin": "1", "totp_secret": "s"},
+            record_dir=str(tmp_path / "rec"),
+        )
+        app.state.watchlist.extend(default_watchlist(mapper)[:1])
+        with TestClient(app):  # entering the context runs the lifespan
+            import time
+
+            for _ in range(50):
+                if started:
+                    break
+                time.sleep(0.05)
+        assert started, "the feed did not come up at boot"
+        assert started["feed_token"] == "feed"
+        assert started["record_path"].endswith("rec")
+
+    def test_feed_does_not_start_without_credentials(self, tmp_path,
+                                                     monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import dashboard as dash
+        from orderflow.instrument_master import build_live_token_map
+
+        if not Path("instruments.json").exists():
+            pytest.skip("instruments.json not downloaded")
+
+        started = []
+        monkeypatch.setattr(dash.FeedRunner, "start_live",
+                            lambda *a, **k: started.append(1))
+        mapper, _ = build_live_token_map("instruments.json")
+        app = dash.build_app(mapper, "instruments.json")  # no credentials
+        app.state.watchlist.extend(default_watchlist(mapper)[:1])
+        with TestClient(app):
+            import time
+
+            time.sleep(0.2)
+        assert not started, "a socket was opened without credentials"
+
+    def test_paper_trader_is_registered_for_the_seeded_watchlist(self):
+        """Autostart only makes sense if the trader knows the instruments."""
+        if not Path("instruments.json").exists():
+            pytest.skip("instruments.json not downloaded")
+        from dashboard import load_dashboard
+
+        app = load_dashboard("instruments.json")
+        trader = app.state.runner.trader
+        assert trader is not None, "paper trading must be on by default"
+        assert trader.instruments, "the seeded watchlist was not registered"
+
+
 class TestServerSideLogin:
     """Start live from the page without the page ever seeing a credential."""
 
@@ -524,3 +602,126 @@ class TestReplay:
             time.sleep(0.1)
         chart = tc.get("/api/chart/NSE_FO_48704").json()
         assert chart["bars"] == [], "an off-session print created a bar"
+
+
+class TestPaperTradingWiring:
+    """The dashboard must run the paper trader on the same prints as the chart."""
+
+    @pytest.fixture()
+    def client(self, tmp_path):
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+
+        if not Path("instruments.json").exists():
+            pytest.skip("instruments.json not downloaded")
+        from dashboard import WatchItem, build_app
+        from orderflow.feed import TokenNamespace
+        from orderflow.instrument_master import build_live_token_map
+
+        mapper, _ = build_live_token_map("instruments.json")
+        app = build_app(mapper)
+        app.state.watchlist.append(WatchItem(
+            label="NIFTY27OCT26FUT", namespace=TokenNamespace.NSE_FO,
+            token=48704, symbol="NIFTY27OCT26FUT", market=Market.NSE,
+            segment="NSE_FNO", tick=0.05,
+        ))
+        cap = tmp_path / "cap.txt"
+        _in_session_capture(cap, n=400)
+        return TestClient(app), cap
+
+    def test_paper_is_on_by_default(self, client):
+        tc, _ = client
+        body = tc.get("/api/paper").json()
+        assert body["enabled"] is True
+        assert body["account"] is not None
+
+    def test_paper_can_be_turned_off(self, client):
+        tc, _ = client
+        assert tc.post("/api/paper", json={"enabled": False}).json()["enabled"] is False
+        assert tc.get("/api/paper").json()["enabled"] is False
+        assert tc.get("/api/paper").json()["account"] is None
+
+    def test_paper_trader_sees_the_replay_prints(self, client):
+        """The wiring proof: every routed print reaches the paper trader.
+
+        The chart and the trader are fed from the same callback. If the
+        dashboard built bars, the trader must have built the same bars from the
+        same prints, because it folds each print into its own session chart.
+        Comparing the two is what proves the print reached the trader rather
+        than stopping at the chart.
+        """
+        tc, cap = client
+        tc.post("/api/feed/start", json={"mode": "replay", "path": str(cap)})
+        import time
+
+        for _ in range(80):
+            body = tc.get("/api/status").json()
+            if body["status"] == "stopped":
+                break
+            time.sleep(0.1)
+
+        assert body["last_error"] is None, body["last_error"]
+        assert body["paper"] is not None, "paper trading was not wired into the run"
+
+        trader = tc.app.state.runner.trader
+        assert trader is not None
+        trader_bars = trader.bars_for("NIFTY27OCT26FUT")
+        assert trader_bars, "the paper trader never saw a print"
+
+        chart = tc.get("/api/chart/NSE_FO_48704").json()
+        assert len(trader_bars) == len(chart["bars"]), (
+            "the trader and the chart disagree on the bars built from one run")
+        assert [b.total_volume for b in trader_bars] == [
+            b["volume"] for b in chart["bars"]]
+
+    def test_paper_account_is_coherent(self, client):
+        """Whatever the account reports must add up."""
+        tc, cap = client
+        tc.post("/api/feed/start", json={"mode": "replay", "path": str(cap)})
+        import time
+
+        for _ in range(80):
+            if tc.get("/api/status").json()["status"] == "stopped":
+                break
+            time.sleep(0.1)
+
+        acct = tc.get("/api/status").json()["paper"]
+        assert set(["equity", "cash", "net_pnl", "realized_pnl",
+                    "unrealized_pnl", "costs", "positions"]) <= set(acct)
+        # The identity the account must always satisfy.
+        assert acct["net_pnl"] == pytest.approx(
+            acct["realized_pnl"] + acct["unrealized_pnl"] - acct["costs"],
+            abs=0.01)
+        for pos in acct["positions"]:
+            assert set(["symbol", "qty", "avg_price", "stop", "target"]) <= set(pos)
+            assert pos["stop"] is not None and pos["target"] is not None
+
+    def test_a_second_replay_does_not_inherit_the_first_paper_book(self, client):
+        """The trader is rebuilt per run, so its book does not accumulate.
+
+        The bug this guards: a trader built once and reused stacked the second
+        replay's prints onto the first run's bars and positions. Two identical
+        replays must therefore produce identical traders.
+        """
+        tc, cap = client
+        import time
+
+        def run_once():
+            tc.post("/api/feed/start", json={"mode": "replay", "path": str(cap)})
+            for _ in range(80):
+                if tc.get("/api/status").json()["status"] == "stopped":
+                    break
+                time.sleep(0.1)
+            trader = tc.app.state.runner.trader
+            return (
+                [b.total_volume for b in trader.bars_for("NIFTY27OCT26FUT")],
+                tc.get("/api/status").json()["paper"],
+            )
+
+        first_bars, first_acct = run_once()
+        second_bars, second_acct = run_once()
+        assert first_bars, "the first replay built no bars in the trader"
+        assert second_bars == first_bars, (
+            "the second replay appended to the first run's trader bars")
+        assert second_acct["entries"] == first_acct["entries"]
+        assert second_acct["cash"] == pytest.approx(first_acct["cash"])
