@@ -231,6 +231,43 @@ class TestServerSideLogin:
         assert r.status_code == 400
         assert "ANGEL_API_KEY" in r.json()["detail"]
 
+    def test_blank_record_path_falls_back_to_the_server_default(self, client,
+                                                                monkeypatch):
+        """The page posts record="" when the operator clears the prompt. That
+        must mean "use the server's directory", not "do not record": a session
+        that is not captured cannot be replayed, and the prompt would be lying
+        about it."""
+        import dashboard as dash
+
+        captured = {}
+
+        def spy(self, session, api_key, client_code, feed_token,
+                record_path=None):
+            captured["record_path"] = record_path
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(dash.FeedRunner, "start_live", spy)
+        r = client.post("/api/feed/start",
+                        json={"mode": "live", "record": ""})
+        assert r.status_code == 400
+        assert captured["record_path"] and captured["record_path"].endswith("rec")
+
+    def test_an_explicit_record_path_is_honoured(self, client, monkeypatch):
+        import dashboard as dash
+
+        captured = {}
+
+        def spy(self, session, api_key, client_code, feed_token,
+                record_path=None):
+            captured["record_path"] = record_path
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(dash.FeedRunner, "start_live", spy)
+        r = client.post("/api/feed/start",
+                        json={"mode": "live", "record": "/tmp/my-session"})
+        assert r.status_code == 400
+        assert captured["record_path"] == "/tmp/my-session"
+
     def test_an_explicit_session_still_wins(self, client, monkeypatch):
         """A caller that supplies a session must not trigger a login."""
         import dashboard as dash

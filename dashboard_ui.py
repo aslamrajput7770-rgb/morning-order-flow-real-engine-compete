@@ -296,11 +296,12 @@ async function post(url, body){
 }
 $("btnStart").onclick = async () => {
   // Credentials live on the server. Ask for a recording path here, because a
-  // session that is not recorded cannot be replayed later.
+  // session that is not recorded cannot be replayed later. Blank keeps the
+  // server's default directory, which is still a recording.
   const rec = prompt(
-    "Record this session to (blank to not record):", "recordings");
+    "Record this session to (blank uses the server default):", "recordings");
   const body = {mode:"live"};
-  if(rec) body.record = rec;
+  body.record = rec || "";
   const r = await post("/api/feed/start", body);
   if(r.detail) alert(r.detail);
 };
