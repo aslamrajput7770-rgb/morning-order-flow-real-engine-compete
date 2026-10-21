@@ -96,7 +96,7 @@ def session_state(specs: list[WatchSpec], now: datetime) -> dict:
         cal = MarketCalendar(spec.market, segment=spec.segment)
         win = cal.session_containing(now)
         out[spec.label] = (
-            f"{win.open.strftime('%H:%M')}-{win.close.strftime('%H:%M')}"
+            f"{win.open_at.strftime('%H:%M')}-{win.close_at.strftime('%H:%M')}"
             if win else "closed"
         )
     return out
