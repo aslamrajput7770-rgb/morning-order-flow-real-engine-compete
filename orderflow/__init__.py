@@ -93,6 +93,19 @@ from .session import (
     us_daylight_saving,
 )
 from .session_chart import SessionChart, SessionState
+from .strategy import Signal, SignalEngine, StrategyConfig, evaluate_latest
+from .paper import (
+    CostModel,
+    Fill,
+    Order,
+    OrderStatus,
+    OrderType,
+    PaperBroker,
+    Position,
+    RoundTrip,
+)
+from .autotrade import AutoTrader, AutoTraderConfig, InstrumentState
+from .supervisor import AlwaysOnFeed, FeedHealth, SupervisorConfig
 from .tape import (
     Counter,
     Tape,
@@ -179,4 +192,26 @@ __all__ = [
     "us_daylight_saving",
     "SessionChart",
     "SessionState",
+    # strategy
+    "Signal",
+    "SignalEngine",
+    "StrategyConfig",
+    "evaluate_latest",
+    # paper trading
+    "PaperBroker",
+    "CostModel",
+    "Order",
+    "OrderType",
+    "OrderStatus",
+    "Fill",
+    "Position",
+    "RoundTrip",
+    # autonomous trading
+    "AutoTrader",
+    "AutoTraderConfig",
+    "InstrumentState",
+    # always-on feed
+    "AlwaysOnFeed",
+    "FeedHealth",
+    "SupervisorConfig",
 ]
