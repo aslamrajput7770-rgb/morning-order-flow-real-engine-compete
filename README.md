@@ -352,11 +352,11 @@ socket delivered. Replay then runs that through the same router, tick reader
 and session chart as a live session. Nothing is interpreted twice, and a
 decoder fix retroactively applies to every recording ever taken.
 
-Writes are crash-safe. Each shard is appended as `.part.gz` and fsynced, then
-renamed once the hour rolls. A `kill -9` costs the last batch, not the file; a
-torn gzip tail still reads back to the last complete record. Shards rotate
-hourly, compress about 20x on real tick payloads, and a month of one instrument
-fits in tens of megabytes.
+Writes are crash-safe. A shard is `<root>/<key>/<YYYYMMDDTHH>.oft.gz`, written
+as `.oft.gz.part` and fsynced, then renamed once the hour rolls. A `kill -9`
+costs the last batch, not the file; a torn gzip tail still reads back to the
+last complete record. Shards rotate hourly, compress about 20x on real tick
+payloads, and a month of one instrument fits in tens of megabytes.
 
 The process exits non-zero if it recorded nothing. An accepted subscription
 outside its session streams silence, which is otherwise indistinguishable from
@@ -372,6 +372,20 @@ python3 replay_backtest.py --rec ./recordings --key conn0 \
 It prints the footprint bars, delta, POC and session value area, and can write
 the bars to JSON. Because it drives the production pipeline, a bar that comes
 out wrong here is wrong live too.
+
+`--rec` is the recording root; `--key` picks one connection when several were
+recorded.
+
+### Recording from the dashboard
+
+`run_dashboard.py --record-dir ./recordings` records every live session started
+from the page. The recorder is closed when the feed stops, so the `.part` shard
+is promoted even if the session ends on an error. The replay button then takes
+the same directory back, and replays it through the identical pipeline.
+
+The page never holds a credential. Login runs on the server from the
+environment, and "Start live" fails with the names of the missing variables
+rather than opening a socket it has no token for.
 
 `--instruments` is required and is not a convenience. The router keys on
 `(namespace, token)` and drops an unregistered token without complaint, so a
