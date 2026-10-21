@@ -362,6 +362,29 @@ The process exits non-zero if it recorded nothing. An accepted subscription
 outside its session streams silence, which is otherwise indistinguishable from
 a quiet market.
 
+### Before the open: rehearse it
+
+The first live run should not be the first time the capture path has executed.
+`--rehearse` drives the whole path on scripted frames, with no socket and no
+credentials, at any hour:
+
+```bash
+python3 record_ticks.py --out /tmp/rehearse --rehearse 60 \
+    --instruments "NSE_FO:48704:0.05"
+python3 replay_backtest.py --rec /tmp/rehearse --key conn0 \
+    --instruments "NSE_FO:48704:0.05"
+```
+
+Everything below the transport is production code, so this exercises the
+subscription send, the recorder, the shard format and the replay reader. The
+frames are anchored inside the session, not at the wall clock: a capture taken
+outside its session produces no bars by design, so a rehearsal stamped "now" at
+07:00 IST would prove the plumbing and nothing else. A rehearsal that reports
+unmapped frames fails, because on the day that would look like a decoder fault.
+
+What the rehearsal cannot cover is the broker's socket and the login. Those are
+the only two things left to go wrong at 09:00.
+
 ### Backtest
 
 ```bash

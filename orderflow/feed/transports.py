@@ -307,6 +307,63 @@ class FileTransport:
         pass
 
 
+class RehearsalTransport:
+    """A live-shaped transport with scripted frames and no socket.
+
+    Exists so the recording path can be exercised end to end before market
+    hours, with no credentials and no network. It is `is_live = True` on
+    purpose: the connector then treats an exhausted frame list as an idle
+    timeout rather than end-of-stream, which is what a real socket does, so the
+    rehearsal follows the live control flow instead of the replay one.
+
+    Frames are teed to the recorder through the same `RecordingTransport` a
+    live socket uses, so a rehearsal writes a real shard that
+    `replay_backtest.py` reads back. Nothing here is a second implementation:
+    the connector, decoder, router and session chart are the production ones.
+    """
+
+    def __init__(self, frames, on_subscribe=None, idle_polls: int = 2) -> None:
+        self._frames = list(frames)
+        self._i = 0
+        self._on_subscribe = on_subscribe
+        self.sent: list = []
+        # Live-shaped: an exhausted script first reads as an idle timeout, the
+        # way a quiet market does, and only then as end-of-stream. `idle_polls`
+        # is how many empty polls to simulate before the stream ends; without
+        # it a rehearsal would spin until its wall-clock budget expired.
+        self._idle_polls = idle_polls
+        self._idle = 0
+        self.is_live = True
+
+    def connect(self) -> None:
+        pass
+
+    def send(self, data, binary: bool = False) -> None:
+        # The subscription is text and is not market data, so it is kept aside
+        # rather than recorded. A test can assert it was sent.
+        self.sent.append(data)
+        if self._on_subscribe is not None:
+            self._on_subscribe(data)
+
+    def heartbeat(self) -> None:
+        pass
+
+    def recv(self, timeout: float | None = None):
+        if self._i >= len(self._frames):
+            self._idle += 1
+            if self._idle > self._idle_polls:
+                # The script is spent. Drop out of "live" so the connector ends
+                # the stream instead of idling to its deadline.
+                self.is_live = False
+            return None
+        frame = self._frames[self._i]
+        self._i += 1
+        return frame
+
+    def close(self) -> None:
+        pass
+
+
 def record_frames(frames: Iterable[bytes | str], path: str | Path) -> Path:
     """Write frames in the `FileTransport` format."""
     p = Path(path)

@@ -246,6 +246,13 @@ Invariants that took a bug each to learn:
   `ANGEL_CLIENT_CODE`, `ANGEL_PIN`, `ANGEL_TOTP_SECRET`. Never from arguments,
   never written to disk, never committed.
 
+- `record_ticks.py --rehearse SECONDS` drives the whole capture path on
+  scripted frames, with no socket and no credentials. `RehearsalTransport` is
+  `is_live = True` so the connector takes the live control flow, then drops out
+  of live mode once the script is spent so the run ends instead of idling to
+  its budget. Frames are anchored inside the session; a rehearsal stamped "now"
+  outside the session produces no bars and proves nothing.
+
 `orderflow/watchlist.py` owns the desk watchlist and the MCX tick table;
 `dashboard.py` delegates to it. There is one tick rule, not two.
 

@@ -41,7 +41,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from orderflow import IST
 from orderflow.feed import (
@@ -50,6 +50,7 @@ from orderflow.feed import (
     require_volume_capable_mode,
     totp,
 )
+from orderflow.feed.protocol import ExchangeType
 from orderflow.instruments import UnknownToken
 from orderflow.instrument_master import build_live_token_map
 from orderflow.recorder import MultiRecorder, finalize_parts
@@ -117,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--master", default="instruments.json")
     ap.add_argument("--dry-run", action="store_true",
                     help="check credentials, master and plan; touch nothing")
+    ap.add_argument("--rehearse", type=float, default=None, metavar="SECONDS",
+                    help="run the whole path on scripted frames, no socket and "
+                         "no credentials, for this many seconds")
     ap.add_argument("--no-finalize", action="store_true",
                     help="skip promoting .part files left by a crash")
     ap.add_argument("--max-reconnects", type=int, default=50)
@@ -185,6 +189,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print("dry run: nothing was connected and nothing was written.")
         return 0
+
+    # -------------------------------------------------------------- rehearsal
+    if args.rehearse is not None:
+        return _rehearse(args, specs, mapper, plan, mode, now)
 
     # ------------------------------------------------------------------ login
     try:
@@ -295,6 +303,126 @@ def main(argv: list[str] | None = None) -> int:
 
     # A silent subscription must not pass as a quiet market.
     return 0 if total_frames > 0 else 1
+
+
+def _rehearse(args, specs, mapper, plan, mode, now) -> int:
+    """Exercise capture end to end with scripted frames and no socket.
+
+    The point is to make the market-open run a formality. Everything below the
+    transport is production code, so a rehearsal that records and replays
+    cleanly means the only untested piece left is the broker's socket. It needs
+    no credentials, so it can be run at any hour.
+
+    Frames are anchored inside the session rather than at the wall clock. A
+    capture taken outside its session produces no bars by design, so a rehearsal
+    stamped "now" would prove the plumbing and nothing else.
+    """
+    from orderflow.feed.simulator import TickSpec, encode_tick
+    from orderflow.feed.transports import RehearsalTransport
+
+    print("rehearsal: scripted frames, no socket, no credentials\n")
+
+    session_start = _session_start_for(specs[0], now)
+    print(f"anchoring frames to {session_start.strftime('%Y-%m-%d %H:%M')} IST "
+          f"(inside the {specs[0].market.value} session)\n")
+
+    recorder = MultiRecorder(args.out, fsync_every=args.fsync_every)
+
+    if mapper is None:
+        mapper = _mapper_for_tokens(specs)
+
+    # A tick every 250 ms of session time, walking the price both ways so delta,
+    # POC and the value area all have something to disagree about.
+    base_ms = int(session_start.timestamp() * 1000)
+    px = 22895.0
+    volume = 1000
+    frames = []
+    count = max(1, int(args.rehearse / 0.25))
+    for i in range(count):
+        px += 0.05 if i % 3 else -0.05
+        volume += 65
+        spec = specs[i % len(specs)]
+        frames.append(encode_tick(TickSpec(
+            mode=mode,
+            exchange_type=ExchangeType.NSE_FO if spec.market.value == "NSE"
+            else ExchangeType.MCX_FO,
+            token=str(spec.token),
+            exchange_timestamp_ms=base_ms + i * 250,
+            last_traded_price=round(px, 2),
+            volume_trade_for_the_day=volume,
+            bids=((round(px - 0.10, 2), 65),),
+            asks=((round(px + 0.05, 2), 65),),
+        )))
+
+    subscribes = []
+
+    def factory(index: int):
+        return RecordingTransport(
+            RehearsalTransport(frames, on_subscribe=subscribes.append),
+            recorder, key=f"conn{index}")
+
+    from orderflow.feed import SmartStreamConnector
+
+    connector = SmartStreamConnector(
+        plan, mapper=mapper, transport_factory=factory,
+        on_error=lambda exc: print(f"  feed error: {type(exc).__name__}: {exc}",
+                                   file=sys.stderr),
+    )
+    connector.run(on_trade=lambda rt: None, max_seconds=args.rehearse,
+                  reconnect=False)
+    recorder.flush_all()
+    recorder.close_all()
+
+    stats = connector.stats
+    print(f"subscription sent: {len(subscribes)}")
+    print(f"frames={stats.frames} ticks={stats.ticks} "
+          f"errors={stats.protocol_errors} unmapped={stats.unmapped}")
+
+    from orderflow.recorder import iter_shards, shard_summary
+
+    shards = list(iter_shards(args.out))
+    for shard in shards:
+        summary = shard_summary(shard)
+        print(f"  {shard}  {summary['records']} records, "
+              f"{shard.stat().st_size/1024:.1f} KB")
+
+    if not shards or stats.frames == 0:
+        print("rehearsal FAILED: nothing was recorded", file=sys.stderr)
+        return 1
+    if stats.unmapped:
+        print(f"rehearsal FAILED: {stats.unmapped} frames were dropped as "
+              f"unmapped; the replay would look like a decoder fault",
+              file=sys.stderr)
+        return 1
+
+    print("\nrehearsal ok: the capture path works. Replay it with:")
+    first = specs[0]
+    print(f"  python3 replay_backtest.py --rec {args.out} --key conn0 "
+          f'--instruments "{first.namespace.value}:{first.token}:{first.tick}"')
+    return 0
+
+
+def _session_start_for(spec: WatchSpec, now: datetime) -> datetime:
+    """A timestamp inside `spec`'s session on `now`'s date.
+
+    Used to anchor rehearsal frames. If the session has not opened yet the
+    frames are placed just after the open; if it has closed they are placed just
+    before the close. A rehearsal must land inside the session or the session
+    chart discards every print, which is correct behaviour and useless as a
+    test.
+    """
+    cal = MarketCalendar(spec.market, segment=spec.segment)
+    if cal.session_containing(now) is not None:
+        return now
+    # session_for returns the window even when `now` is outside it, so its
+    # bounds are the anchors to clamp to.
+    window = cal.session_for(now.date())
+    if now < window.open_at:
+        return window.open_at
+    if now >= window.close_at:
+        return window.close_at - timedelta(minutes=5)
+    return window.open_at
+
 
 
 def _mapper_for_tokens(specs):
