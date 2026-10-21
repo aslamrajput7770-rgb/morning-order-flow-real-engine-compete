@@ -328,6 +328,18 @@ Invariants that took a bug each to learn:
   `.oft.gz` must go to `ShardTransport`: `FileTransport` utf-8 decodes its
   input, so feeding it a gzip shard reports a decode error rather than
   replaying.
+- **The connector routes only the tokens in the subscription plan.** A live
+  server sends nothing else, but a replay shard holds *every* token that was
+  recorded on the connection, so without a filter a one-instrument replay routes
+  the whole shard. A NIFTY-only replay of a real capture routed all five desk
+  symbols and took a CRUDEOIL trade: the "plan" was meaningless and every
+  strategy conclusion drawn from a replay was unsound. `SmartStreamConnector`
+  now builds a `(namespace, token)` set from `plan.all()` and drops anything
+  outside it before the reader sees it, so a foreign token cannot even seed its
+  volume-delta state. The drop is counted as `not_subscribed`, kept distinct
+  from `unmapped` (a token absent from the master, which is a real config
+  fault): one means "a real instrument we did not ask for", the other means "the
+  master is stale".
 - Credentials come from the environment only: `ANGEL_API_KEY`,
   `ANGEL_CLIENT_CODE`, `ANGEL_PIN`, `ANGEL_TOTP_SECRET`. Never from arguments,
   never written to disk, never committed.
