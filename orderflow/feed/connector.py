@@ -392,6 +392,7 @@ class SmartStreamConnector:
         max_seconds: float | None = None,
         reconnect: bool = True,
         max_reconnects: int = 5,
+        should_stop: Callable[[], bool] | None = None,
     ) -> ConnectorStats:
         """Consume frames until the transport is exhausted or a limit is hit.
 
@@ -403,6 +404,10 @@ class SmartStreamConnector:
         when it elapses, so a live session cannot run forever by accident.
         `reconnect` retries a dropped socket up to `max_reconnects` times with
         backoff, resubscribing each time.
+
+        `should_stop` is polled between frames. A live socket idles rather than
+        ending, so without it an operator's stop would not be seen until the
+        `max_seconds` budget elapsed, which can be hours.
         """
         started = clock()
         for index, session in enumerate(self.plan.sessions):
@@ -410,6 +415,8 @@ class SmartStreamConnector:
                 continue
             attempt = 0
             while True:
+                if should_stop is not None and should_stop():
+                    return self.stats
                 transport = self.transport_factory(index)
                 try:
                     transport.connect()
@@ -428,6 +435,7 @@ class SmartStreamConnector:
                     self._consume(
                         transport, on_trade, max_frames, clock,
                         deadline=None if max_seconds is None else started + max_seconds,
+                        should_stop=should_stop,
                     )
                 except Exception as exc:
                     # A live socket dies in many ways (reset, SSL, decode of a
@@ -438,6 +446,8 @@ class SmartStreamConnector:
                 finally:
                     transport.close()
 
+                if should_stop is not None and should_stop():
+                    return self.stats
                 attempt += 1
                 # Reconnect only applies to a live socket. A replay is exhausted
                 # on purpose, so retrying it would sleep through the backoff and
@@ -459,9 +469,12 @@ class SmartStreamConnector:
         max_frames: int | None,
         clock: Callable[[], float],
         deadline: float | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         idle_since: float | None = None
         while True:
+            if should_stop is not None and should_stop():
+                return
             if max_frames is not None and self.stats.frames >= max_frames:
                 return
             if deadline is not None and clock() >= deadline:

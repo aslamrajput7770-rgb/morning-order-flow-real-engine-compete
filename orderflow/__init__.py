@@ -90,9 +90,11 @@ from .session import (
     MarketCalendar,
     SessionTracker,
     SessionWindow,
+    UnionCalendar,
     us_daylight_saving,
 )
 from .session_chart import SessionChart, SessionState
+from .session_store import SessionStore
 from .strategy import Signal, SignalEngine, StrategyConfig, evaluate_latest
 from .paper import (
     CostModel,
@@ -187,6 +189,7 @@ __all__ = [
     "IST",
     "Market",
     "MarketCalendar",
+    "UnionCalendar",
     "SessionWindow",
     "SessionTracker",
     "us_daylight_saving",
@@ -214,4 +217,6 @@ __all__ = [
     "AlwaysOnFeed",
     "FeedHealth",
     "SupervisorConfig",
+    # persistence
+    "SessionStore",
 ]

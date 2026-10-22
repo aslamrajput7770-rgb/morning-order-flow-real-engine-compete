@@ -54,6 +54,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-default-watchlist", action="store_true")
     ap.add_argument("--record-dir", default="recordings",
                     help="where a live session is recorded; empty to disable")
+    ap.add_argument("--session-file", default="last_session.json",
+                    help="where the last run is remembered for the next boot")
     args = ap.parse_args(argv)
 
     if not Path(args.master).exists():
@@ -69,6 +71,7 @@ def main(argv=None) -> int:
         mapper, args.master,
         credentials=creds or None,
         record_dir=args.record_dir or None,
+        session_path=args.session_file,
     )
     if not args.no_default_watchlist:
         items = default_watchlist(mapper)

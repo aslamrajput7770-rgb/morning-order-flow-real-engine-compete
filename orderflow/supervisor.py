@@ -143,6 +143,7 @@ class AlwaysOnFeed:
                     on_trade=self._on_trade,
                     max_seconds=budget,
                     reconnect=True,
+                    should_stop=self.stopping,
                 )
                 self._absorb(stats)
                 # A clean end of a run is normal: either the budget elapsed or

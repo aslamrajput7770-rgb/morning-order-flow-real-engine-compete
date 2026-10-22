@@ -49,9 +49,23 @@ from orderflow.instrument_master import (
     load_master,
     upcoming_futures,
 )
-from orderflow.session import Market, MarketCalendar
+from orderflow.session import Market, MarketCalendar, UnionCalendar
 from orderflow.session_chart import SessionChart
+from orderflow.supervisor import AlwaysOnFeed, SupervisorConfig
 from orderflow.ticks import TickGrid
+from orderflow import session_store
+
+#: How the supervisor's health state maps to the status the page shows. A
+#: state not listed here (idle, stopped) keeps whatever the runner set, so a
+#: finished replay still reads "stopped" rather than a supervisor word.
+_STATUS_FROM_HEALTH = {
+    "waiting": "market closed",
+    "connecting": "connecting",
+    "streaming": "streaming",
+    "reconnecting": "reconnecting",
+    "error": "error",
+}
+
 
 @dataclass
 class WatchItem:
@@ -100,6 +114,16 @@ class DashboardState:
     last_error: str | None = None
     feed_thread: threading.Thread | None = None
     source: str = "live"  # "live" or a capture path
+    #: The supervisor's health view (state, next_open_at, attempts, ...). Empty
+    #: until a supervised live run starts. This is how the page can tell "market
+    #: closed" from "feed broken" instead of showing a silent zero.
+    feed: dict = field(default_factory=dict)
+    #: The previous run's snapshots, loaded at boot. Present so the page shows
+    #: the last known POC and PnL rather than an empty box.
+    last_session: dict | None = None
+    #: True when the server holds credentials, so the page can say why there is
+    #: no live session instead of leaving it a mystery.
+    live_configured: bool = False
 
     def note_tick(self, key: str) -> None:
         with self.lock:
@@ -112,7 +136,8 @@ class DashboardState:
         Charts and counters belong to one run, not to the process. Keeping them
         across runs made a second replay append its bars to the first: six bars
         became twelve, and the volume, delta and POC shown were the sum of two
-        unrelated captures. The watchlist is configuration, so it stays.
+        unrelated captures. The watchlist is configuration, so it stays, and so
+        does `last_session`, which belongs to the *previous* run by definition.
         """
         with self.lock:
             self.charts = {}
@@ -129,11 +154,16 @@ class DashboardState:
 class FeedRunner:
     """Owns the feed thread and the connector lifecycle."""
 
-    def __init__(self, state: DashboardState, mapper: TokenMapper) -> None:
+    def __init__(self, state: DashboardState, mapper: TokenMapper,
+                 store: "session_store.SessionStore | None" = None) -> None:
         self.state = state
         self.mapper = mapper
+        self.store = store or session_store.SessionStore()
         self._stop = threading.Event()
         self._conn: SmartStreamConnector | None = None
+        self._supervisor: AlwaysOnFeed | None = None
+        self._supervised = False
+        self._calendar = MarketCalendar(Market.NSE, segment="NSE_FNO")
         self._recorder = None
         # Paper trading is off unless a caller enables it. When on, every routed
         # trade is fed to the auto-trader as well as to the chart, so the same
@@ -210,6 +240,24 @@ class FeedRunner:
         return acct
 
     # ------------------------------------------------------------------ live
+    def calendar_for_watchlist(self):
+        """A calendar covering every market in the watchlist.
+
+        A desk watchlist mixes NSE and MCX. A single NSE calendar would end the
+        feed at 15:40 and silently drop the MCX evening session, so build the
+        union of the markets actually watched. With no watchlist, fall back to
+        NSE F&O, which is the common case.
+        """
+        markets: list[tuple[Market, str]] = []
+        for w in self.state.watchlist:
+            pair = (w.market, w.segment)
+            if pair not in markets:
+                markets.append(pair)
+        if not markets:
+            markets = [(Market.NSE, "NSE_FNO")]
+        cals = [MarketCalendar(m, segment=s) for m, s in markets]
+        return cals[0] if len(cals) == 1 else UnionCalendar(cals)
+
     def start_live(self, session: dict, api_key: str, client_code: str,
                    feed_token: str, record_path: str | None = None) -> None:
         if self.state.running:
@@ -217,37 +265,52 @@ class FeedRunner:
         pairs = [(w.namespace, w.token) for w in self.state.watchlist]
         if not pairs:
             raise RuntimeError("watchlist is empty")
-        plan = build_plan(pairs, mode=SubscriptionMode.SNAP_QUOTE)
         jwt = session.get("jwtToken")
         if not jwt:
             raise RuntimeError("login response had no jwtToken")
         token = session.get("feedToken") or feed_token
+        self._calendar = self.calendar_for_watchlist()
 
-        def factory(index):
-            ws = WebSocketTransport(
-                auth_token=jwt,
-                api_key=api_key,
-                client_code=client_code,
-                feed_token=token,
-            )
-            if record_path:
-                # Tee the live stream to disk so the session can be replayed
-                # later. The tee is transparent: a write failure is swallowed
-                # and the feed keeps running, because a full disk must not take
-                # the desk's data feed down with it.
-                from orderflow.recorder import MultiRecorder
-                from orderflow.feed.transports import RecordingTransport
+        def make_connector():
+            # Rebuild the transport on every supervisor (re)build, because the
+            # supervisor rebuilds precisely when the old socket or token is
+            # suspect. A fresh plan is rebuilt too: the watchlist may have
+            # changed since the last run.
+            plan = build_plan(
+                [(w.namespace, w.token) for w in self.state.watchlist],
+                mode=SubscriptionMode.SNAP_QUOTE)
 
-                if self._recorder is None:
-                    self._recorder = MultiRecorder(record_path)
-                return RecordingTransport(ws, self._recorder, key=f"conn{index}")
-            return ws
+            def factory(index):
+                ws = WebSocketTransport(
+                    auth_token=jwt,
+                    api_key=api_key,
+                    client_code=client_code,
+                    feed_token=token,
+                )
+                if record_path:
+                    # Tee the live stream to disk so the session can be replayed
+                    # later. The tee is transparent: a write failure is swallowed
+                    # and the feed keeps running, because a full disk must not
+                    # take the desk's data feed down with it.
+                    from orderflow.recorder import MultiRecorder
+                    from orderflow.feed.transports import RecordingTransport
 
-        self._launch(
-            lambda: self._run(lambda: SmartStreamConnector(
-                plan, self.mapper, factory, on_error=self._on_error)),
-            source="live",
-        )
+                    if self._recorder is None:
+                        self._recorder = MultiRecorder(record_path)
+                    return RecordingTransport(ws, self._recorder, key=f"conn{index}")
+                return ws
+
+            return SmartStreamConnector(
+                plan, self.mapper, factory, on_error=self._on_error)
+
+        def make_connector_capture():
+            conn = make_connector()
+            # `_on_trade` mirrors the connector's counters for the header.
+            self._conn = conn
+            return conn
+
+        self._supervised = True
+        self._launch(lambda: self._run(make_connector_capture), source="live")
 
     # -------------------------------------------------------------- replay
     def start_replay(self, path: str) -> None:
@@ -283,11 +346,17 @@ class FeedRunner:
         if not pairs:
             pairs = [(TokenNamespace.NSE_FO, 48704)]
         plan = build_plan(pairs, mode=SubscriptionMode.SNAP_QUOTE)
-        self._launch(
-            lambda: self._run(lambda: SmartStreamConnector(
-                plan, self.mapper, factory, on_error=self._on_error)),
-            source=path,
-        )
+
+        def make_connector():
+            conn = SmartStreamConnector(
+                plan, self.mapper, factory, on_error=self._on_error)
+            # `_on_trade` mirrors the connector's counters, and a replay has a
+            # single connector for the whole run.
+            self._conn = conn
+            return conn
+
+        self._supervised = False
+        self._launch(lambda: self._run(make_connector), source=path)
 
     # --------------------------------------------------------------- runner
     def _launch(self, work, source: str) -> None:
@@ -310,40 +379,47 @@ class FeedRunner:
         t.start()
 
     def _run(self, make_conn) -> None:
+        """Run the feed. A live session is supervised; a replay is one pass.
+
+        The supervisor is what makes a live feed survive a session boundary, an
+        expired token and a run of failures. Driving the connector directly, as
+        this used to, meant the feed could not tell a closed market from a dead
+        socket: it would sit in `streaming` with zero ticks all night.
+        """
+        if self._supervised:
+            self._run_supervised(make_conn)
+        else:
+            self._run_once(make_conn)
+
+    def _run_supervised(self, make_conn) -> None:
+        try:
+            self._supervisor = AlwaysOnFeed(
+                self._calendar, make_conn,
+                SupervisorConfig(), on_trade=self._on_trade,
+            )
+            poller = threading.Thread(
+                target=self._sync_health, name="orderflow-health", daemon=True)
+            poller.start()
+            # Returns only when the operator stops it. A supervised feed is
+            # meant to outlive every session, so it has no natural end.
+            self._supervisor.run()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            with self.state.lock:
+                self.state.last_error = f"{type(exc).__name__}: {exc}"
+                self.state.status = "error"
+        finally:
+            self._finish_run()
+
+    def _run_once(self, make_conn) -> None:
+        """One pass over the transport. This is the replay path."""
         try:
             self._conn = make_conn()
             with self.state.lock:
                 self.state.status = "streaming"
-
-            def on_trade(rt):
-                chart = self._chart_for(rt)
-                if chart is not None:
-                    chart.add(rt.trade)
-                # Paper trading sees the same prints the chart does. It is fed
-                # after the chart so a trader exception cannot lose a bar.
-                if self.trader is not None:
-                    try:
-                        self._paper_on_trade(rt)
-                    except Exception as exc:  # noqa: BLE001
-                        with self.state.lock:
-                            self.state.last_error = f"paper trader: {exc}"
-                # The connector's counters are only returned when `run` ends,
-                # and an always-on feed never ends. Mirror them here so the
-                # header shows a live tick count instead of a frozen zero.
-                conn_stats = getattr(self._conn, "stats", None)
-                with self.state.lock:
-                    self.state.trades += 1
-                    if conn_stats is not None:
-                        self.state.frames = conn_stats.frames
-                        self.state.ticks = conn_stats.ticks
-                        self.state.unmapped = conn_stats.unmapped
-                        self.state.protocol_errors = conn_stats.protocol_errors
-                    self.state.last_tick_at = time.time()
-
             stats = self._conn.run(
-                on_trade=on_trade,
+                on_trade=self._on_trade,
                 max_seconds=None,
-                reconnect=True,
+                reconnect=False,
                 clock=time.monotonic,
             )
             with self.state.lock:
@@ -358,19 +434,122 @@ class FeedRunner:
                 self.state.last_error = f"{type(exc).__name__}: {exc}"
                 self.state.status = "error"
         finally:
-            if self._recorder is not None:
-                try:
-                    self._recorder.flush_all()
-                    self._recorder.close_all()
-                except Exception as exc:  # noqa: BLE001 - surfaced to the UI
-                    with self.state.lock:
-                        self.state.last_error = (
-                            f"recorder close failed: {type(exc).__name__}: {exc}")
-                self._recorder = None
+            self._finish_run()
+
+    def _on_trade(self, rt) -> None:
+        """Fold one routed print into the chart, the trader and the counters.
+
+        The chart and the paper trader are fed from here and nowhere else, so
+        the two can never disagree about which prints they saw. The trader runs
+        after the chart so a trader exception cannot cost a bar.
+        """
+        chart = self._chart_for(rt)
+        if chart is not None:
+            chart.add(rt.trade)
+        if self.trader is not None:
+            try:
+                self._paper_on_trade(rt)
+            except Exception as exc:  # noqa: BLE001
+                with self.state.lock:
+                    self.state.last_error = f"paper trader: {exc}"
+        # The connector's counters are only returned when `run` ends, and a
+        # supervised feed does not end on its own. Mirror them here so the
+        # header shows a live count instead of a frozen zero.
+        conn_stats = getattr(self._conn, "stats", None)
+        with self.state.lock:
+            self.state.trades += 1
+            if conn_stats is not None:
+                self.state.frames = conn_stats.frames
+                self.state.ticks = conn_stats.ticks
+                self.state.unmapped = conn_stats.unmapped
+                self.state.protocol_errors = conn_stats.protocol_errors
+            self.state.last_tick_at = time.time()
+
+    def _sync_health(self) -> None:
+        """Mirror the supervisor's health into the state the page reads.
+
+        The supervisor knows why it is not streaming (closed market, backoff,
+        reconnecting) and the connector does not. Without this the page can only
+        show a status string it sets itself, which is how a closed market came
+        to look like a stalled feed.
+        """
+        while not self._stop.is_set():
+            sup = self._supervisor
+            if sup is not None:
+                health = sup.snapshot()
+                with self.state.lock:
+                    self.state.feed = health
+                    mapped = _STATUS_FROM_HEALTH.get(health["state"])
+                    if mapped is not None and self.state.running:
+                        self.state.status = mapped
+            self._stop.wait(0.5)
+
+    def _finish_run(self) -> None:
+        """Close the recorder, persist the run, and mark the feed stopped."""
+        # Stop the health poller: its loop is bounded by this flag, and a run
+        # that has ended has no health left to mirror.
+        self._stop.set()
+        if self._recorder is not None:
+            try:
+                self._recorder.flush_all()
+                self._recorder.close_all()
+            except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+                with self.state.lock:
+                    self.state.last_error = (
+                        f"recorder close failed: {type(exc).__name__}: {exc}")
+            self._recorder = None
+        self._persist()
+        final_feed = self.feed_health()
+        with self.state.lock:
+            self.state.running = False
+            if final_feed:
+                # Keep the last health view so the page reads "stopped", not the
+                # "streaming" it last saw while the run was live.
+                self.state.feed = final_feed
+            if self.state.status not in ("error",):
+                self.state.status = "stopped"
+
+    def _snapshot_payload(self) -> dict:
+        """The last-session snapshot: the same JSON the page renders."""
+        with self.state.lock:
+            keys = [w.key() for w in self.state.watchlist]
+            source = self.state.source
+            started_at = self.state.started_at
+            ticks = self.state.ticks
+            trades = self.state.trades
+        return {
+            "saved_at": time.time(),
+            "started_at": started_at,
+            "source": source,
+            "ticks": ticks,
+            "trades": trades,
+            "charts": {k: chart_snapshot(self.state, k) for k in keys},
+            "paper": self.paper_snapshot(),
+        }
+
+    def _persist(self) -> None:
+        """Save the run for the next boot, if it produced anything.
+
+        An empty run must not overwrite a good snapshot with zeros: that would
+        turn "the last session had a POC" into "the last session was blank" on
+        the strength of a run that never received a tick. The test is whether the
+        run *saw* anything, not whether the payload has charts: a populated
+        watchlist yields chart stubs even when no tick ever arrived.
+        """
+        try:
+            payload = self._snapshot_payload()
+        except Exception:  # noqa: BLE001 - never let persistence break a run
+            return
+        if not payload["ticks"] and not payload["trades"]:
+            return
+        if self.store.save(payload):
             with self.state.lock:
-                self.state.running = False
-                if self.state.status not in ("error",):
-                    self.state.status = "stopped"
+                self.state.last_session = payload
+
+    def feed_health(self) -> dict:
+        """The supervisor's health, or an empty view before a live run."""
+        sup = self._supervisor
+        return sup.snapshot() if sup is not None else {}
 
     def _chart_for(self, rt) -> SessionChart | None:
         inst = rt.instrument
@@ -401,10 +580,12 @@ class FeedRunner:
             self.state.protocol_errors += 1
 
     def stop(self) -> None:
-        # The connector has no stop(); it exits when its wall-clock budget
-        # elapses. Dropping the transport closes the socket, which makes the
-        # blocking recv return and lets the loop unwind.
+        # A supervised feed is stopped through the supervisor, which also
+        # unblocks its wait-for-open sleep. The connector has no stop(); its
+        # `should_stop` callback polls the supervisor's flag between frames.
         self._stop.set()
+        if self._supervisor is not None:
+            self._supervisor.stop()
         self._conn = None
         with self.state.lock:
             self.state.running = False
@@ -455,10 +636,19 @@ def bar_snapshot(bar) -> dict:
 def chart_snapshot(state: DashboardState, key: str, bars: int = 60) -> dict:
     with state.lock:
         chart = state.charts.get(key)
-        label = state.labels.get(key, key)
+        label = state.labels.get(key)
         watch = next((w for w in state.watchlist if w.key() == key), None)
+    # The label is a display string, never a token. `NSE_FO_48704` is a URL key,
+    # and showing it to a trader looks like a corrupt feed. Prefer the recorded
+    # label, then the watch symbol, and fall back to a dash.
+    display = label or (watch.symbol if watch else None) or "-"
+    symbol = (watch.symbol if watch else None) or label or None
     if chart is None:
-        return {"key": key, "label": label, "bars": [], "cumulative_delta": []}
+        # An empty stub: the page must render "no data", not a token number.
+        return {
+            "key": key, "label": display, "symbol": symbol,
+            "bars": [], "cumulative_delta": [], "profile": None,
+        }
 
     st = chart.state
     bars_out = []
@@ -492,8 +682,8 @@ def chart_snapshot(state: DashboardState, key: str, bars: int = 60) -> dict:
 
     return {
         "key": key,
-        "label": label,
-        "symbol": watch.symbol if watch else label,
+        "label": display,
+        "symbol": symbol,
         "tick": chart.grid.tick_size,
         "bar_seconds": chart.bar_seconds,
         "bars": bars_out,
@@ -527,6 +717,7 @@ def build_app(
     master_path: str = "instruments.json",
     credentials: dict | None = None,
     record_dir: str | None = None,
+    session_path: str | None = None,
 ) -> FastAPI:
     """Build the dashboard app.
 
@@ -534,9 +725,24 @@ def build_app(
     own. Without them the page can still search instruments and replay a
     recording, and "Start live" says why it cannot proceed rather than opening
     a socket it has no token for.
+
+    `session_path` is where the last run is remembered, so a boot with no live
+    session shows the last known POC and PnL instead of a blank page.
     """
     state = DashboardState()
-    runner = FeedRunner(state, mapper)
+    store = session_store.SessionStore(
+        session_path or session_store.DEFAULT_PATH)
+    runner = FeedRunner(state, mapper, store)
+    # "Configured" means a login is actually possible. A lone feed token is not
+    # enough, and telling the page it is configured would promise a live session
+    # that could never start.
+    state.live_configured = bool(
+        credentials
+        and all(credentials.get(k) for k in
+                ("api_key", "client_code", "pin", "totp_secret")))
+    # Load the previous run before the app serves anything, so the first
+    # snapshot the page fetches already carries it.
+    state.last_session = store.load()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -599,6 +805,12 @@ def build_app(
                 "last_error": state.last_error,
                 "last_tick_at": state.last_tick_at,
                 "started_at": state.started_at,
+                # The supervisor's view: why the feed is or is not streaming.
+                # "market closed" and "waiting for open" are answers; a silent
+                # zero is not.
+                "feed": dict(state.feed),
+                "live_configured": state.live_configured,
+                "last_session": state.last_session,
                 "paper": runner.paper_snapshot(),
                 "watchlist": [
                     {

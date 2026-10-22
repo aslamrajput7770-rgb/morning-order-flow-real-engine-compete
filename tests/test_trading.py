@@ -329,7 +329,8 @@ class TestAlwaysOnFeed:
         calls = {"n": 0}
 
         class FakeConn:
-            def run(self, on_trade=None, max_seconds=None, reconnect=True):
+            def run(self, on_trade=None, max_seconds=None, reconnect=True,
+                    should_stop=None):
                 calls["n"] += 1
                 feed.stop()
                 return type("S", (), {"frames": 0, "reconnects": 0})()
@@ -346,7 +347,8 @@ class TestAlwaysOnFeed:
         calls = {"n": 0}
 
         class FlakyConn:
-            def run(self, on_trade=None, max_seconds=None, reconnect=True):
+            def run(self, on_trade=None, max_seconds=None, reconnect=True,
+                    should_stop=None):
                 calls["n"] += 1
                 if calls["n"] >= 3:
                     feed.stop()
@@ -375,7 +377,8 @@ class TestAlwaysOnFeed:
                 feed.stop()
 
         class FakeConn:
-            def run(self, on_trade=None, max_seconds=None, reconnect=True):
+            def run(self, on_trade=None, max_seconds=None, reconnect=True,
+                    should_stop=None):
                 feed.stop()
                 return type("S", (), {"frames": 0, "reconnects": 0})()
 
@@ -394,3 +397,85 @@ class TestAlwaysOnFeed:
 
         feed = AlwaysOnFeed(self._calendar(), lambda: None)
         json.dumps(feed.snapshot())
+
+    def test_should_stop_ends_a_live_run_between_frames(self):
+        """A stop must be seen without waiting out the run budget.
+
+        A live socket idles rather than ending, so a stop that is not polled
+        between frames would not be honoured until the 6-hour budget elapsed.
+        """
+        from orderflow.supervisor import AlwaysOnFeed
+
+        polls = {"n": 0}
+
+        class FakeConn:
+            def run(self, on_trade=None, max_seconds=None, reconnect=True,
+                    should_stop=None):
+                # The connector polls this; here we drive it to True and assert
+                # the supervisor's own flag is what the connector sees.
+                assert should_stop is not None, "no stop hook was passed"
+                polls["n"] += 1
+                feed.stop()
+                assert should_stop() is True
+                return type("S", (), {"frames": 0, "reconnects": 0})()
+
+        feed = AlwaysOnFeed(self._calendar(), lambda: FakeConn(),
+                            clock=self._open_clock())
+        feed.run()
+        assert polls["n"] == 1
+        assert feed.health.stopped
+
+
+class TestUnionCalendar:
+    """A mixed NSE+MCX watchlist must stay open while either market trades."""
+
+    def _union(self):
+        from orderflow.session import UnionCalendar
+
+        return UnionCalendar([
+            MarketCalendar(Market.NSE, segment="NSE_FNO"),
+            MarketCalendar(Market.MCX, segment="MCX_FO"),
+        ])
+
+    def test_open_while_the_late_market_still_trades(self):
+        """15:40-23:30: NSE is shut, MCX is not, so the union is open.
+
+        An NSE-only calendar would sleep through the entire MCX evening session.
+        """
+        from orderflow.session import IST
+
+        u = self._union()
+        evening = datetime(2026, 10, 21, 19, 0, tzinfo=IST)
+        assert u.is_open(evening), "the union closed while MCX was still trading"
+
+    def test_closed_when_both_are_shut(self):
+        from orderflow.session import IST
+
+        u = self._union()
+        night = datetime(2026, 10, 21, 2, 0, tzinfo=IST)
+        assert not u.is_open(night)
+
+    def test_next_open_is_the_earliest_of_the_members(self):
+        from orderflow.session import IST
+
+        u = self._union()
+        night = datetime(2026, 10, 21, 2, 0, tzinfo=IST)
+        nxt = u.next_open(night)
+        # NSE F&O opens 09:15; MCX opens 09:00, so the earliest wins.
+        assert nxt.hour == 9 and nxt.minute == 0
+
+    def test_a_single_member_union_behaves_like_that_market(self):
+        from orderflow.session import IST, UnionCalendar
+
+        u = UnionCalendar([MarketCalendar(Market.NSE, segment="NSE_FNO")])
+        inside = datetime(2026, 10, 21, 11, 0, tzinfo=IST)
+        assert u.is_open(inside)
+        assert u.session_key(inside) is not None
+
+    def test_an_empty_union_is_rejected(self):
+        import pytest as _pytest
+
+        from orderflow.session import UnionCalendar
+
+        with _pytest.raises(ValueError):
+            UnionCalendar([])

@@ -236,10 +236,46 @@ Design rules that are easy to break by accident:
 - **The trader is rebuilt on every run start** (`_launch` -> `enable_paper`),
   and the watchlist is re-registered then too, because the page can edit it and
   the default watchlist is seeded after `build_app`.
-- **Live counters are mirrored from the connector inside `on_trade`.** The
+- **Live counters are mirrored from the connector inside `_on_trade`.** The
   connector's stats are only returned when `run` ends, and an always-on feed
   never ends, so reading them after `run` would leave `frames`/`ticks` frozen
   at zero forever.
+- **A live run goes through `AlwaysOnFeed`, never the connector directly.**
+  Driving `SmartStreamConnector` from the dashboard meant a closed market
+  booted to `streaming` with zero ticks and no explanation: the connector
+  cannot tell "market shut" from "socket dead". `FeedRunner._run` dispatches on
+  `_supervised` — live is supervised, replay is a single pass (`_run_once`).
+  Keep the name `_run`: existing tests monkeypatch it.
+- **The supervisor's health is mirrored into the page every 0.5 s**
+  (`_sync_health` -> `state.feed`). `_STATUS_FROM_HEALTH` maps it to a status;
+  a state not in that table (idle, stopped) keeps the runner's own value, so a
+  finished replay still reads `stopped`. `waiting` must map to `market closed`,
+  never to `streaming` — that silent zero was the reported bug.
+- **`stop()` must reach the supervisor, not just the flag.** `AlwaysOnFeed.stop`
+  unblocks the wait-for-open sleep; the connector's `should_stop` callback polls
+  the same flag between frames. Without it a stop during a live session was not
+  seen until the 6-hour `run_seconds` budget elapsed.
+- **The calendar is built from the watchlist** (`calendar_for_watchlist`): a
+  mixed NSE+MCX list yields a `UnionCalendar` (open while *any* member is open),
+  so the feed does not sleep through the MCX evening session when NSE closes at
+  15:40. A single-market list still yields a plain `MarketCalendar`.
+- **The last run is persisted to `last_session.json`** (`orderflow/session_store.py`)
+  and reloaded at boot, so a closed market or a restart shows the last known
+  POC, cumulative delta and PnL with the time they were taken, clearly marked
+  "showing last session". `_persist` skips a run that saw no tick: a populated
+  watchlist yields chart *stubs*, so "has charts" is not a proxy for "saw
+  something", and a zero run must not clobber a good snapshot. The file is
+  gitignored; the test suite redirects `DEFAULT_PATH` so it never lands in the
+  repo root.
+- **A chart label is a display string, never a token.** `NSE_FO_48704` is the
+  URL key; showing it looks like a corrupt feed. `chart_snapshot` falls back to
+  the watch symbol, then `-`. The Session panel likewise shows `-` for bar size
+  and cum delta when there are no bars, rather than `0s`.
+- **Page layout is a contract, pinned by tests.** The top strip (Net PnL, Hold,
+  Exits, Live) sits above everything; engine panels (cum delta, delta bars,
+  volume profile, session) come *before* the paper panels (account, positions,
+  closed trades) — hisab above engine was the reported bug. Below 900px the grid
+  collapses to one column. `TestPageLayout` asserts all of this.
 - The feed runs on one background thread and owns the socket. The WebSocket
   handler only reads the latest snapshot. If the browser were allowed to drive
   the socket, a stalled tab would stall the exchange connection.

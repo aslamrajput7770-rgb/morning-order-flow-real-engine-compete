@@ -193,6 +193,43 @@ class MarketCalendar:
         return start + timedelta(seconds=offset * bar_seconds)
 
 
+class UnionCalendar:
+    """A calendar over several markets: open while *any* member is open.
+
+    A desk watchlist mixes NSE and MCX. The NSE session ends at 15:40 and the
+    MCX session runs to 23:30, so a supervisor driven by the NSE calendar alone
+    would sleep from 15:40 and stop streaming MCX for the rest of its session,
+    silently. The union fixes that: the feed stays up while any watched market
+    trades, and `next_open` is the earliest of the members' next opens.
+    """
+
+    def __init__(self, calendars: list[MarketCalendar]) -> None:
+        if not calendars:
+            raise ValueError("UnionCalendar needs at least one calendar")
+        self.calendars = calendars
+
+    def session_containing(self, ts: datetime) -> SessionWindow | None:
+        for cal in self.calendars:
+            win = cal.session_containing(ts)
+            if win is not None:
+                return win
+        return None
+
+    def is_open(self, ts: datetime) -> bool:
+        return self.session_containing(ts) is not None
+
+    def session_key(self, ts: datetime) -> int | None:
+        win = self.session_containing(ts)
+        return None if win is None else win.trading_date.toordinal()
+
+    def session_start(self, ts: datetime) -> datetime | None:
+        win = self.session_containing(ts)
+        return None if win is None else win.open_at
+
+    def next_open(self, ts: datetime) -> datetime:
+        return min(cal.next_open(ts) for cal in self.calendars)
+
+
 @dataclass(slots=True)
 class SessionTracker:
     """Tracks session rollovers and reports when a reset is due."""

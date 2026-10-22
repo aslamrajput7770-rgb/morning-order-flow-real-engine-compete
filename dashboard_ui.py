@@ -80,6 +80,30 @@ INDEX_HTML = r"""<!DOCTYPE html>
   details summary{cursor:pointer;color:var(--dim);padding:2px 0}
   input[type=text]{background:var(--panel2);border:1px solid var(--line);
         color:var(--txt);padding:4px 7px;border-radius:4px;font:inherit;width:230px}
+  /* The four numbers a trader checks first, on one line, above everything.
+     Equity and costs stay in the paper panel: the strip is a glance, not a
+     report, and crowding it defeats the point of having it. */
+  .strip{display:flex;align-items:baseline;gap:26px;padding:10px 14px;
+         background:var(--panel2);border-bottom:1px solid var(--line);
+         flex-wrap:wrap}
+  .strip .cell{display:flex;align-items:baseline;gap:8px}
+  .strip .k{color:var(--dim);font-size:10px;letter-spacing:.16em;
+            text-transform:uppercase}
+  .strip .v{font-size:24px;font-weight:700;letter-spacing:.02em;line-height:1}
+  .strip .v.pos{color:var(--buy)} .strip .v.neg{color:var(--sell)}
+  .strip .v.dim{color:var(--dim);font-weight:600}
+  .strip .stale{margin-left:auto;color:var(--dim);font-size:11px;
+                border:1px solid var(--line);border-radius:10px;padding:2px 9px}
+  .strip .stale.warn{border-color:var(--poc);color:var(--poc)}
+  /* One column below tablet width. The two-column grid squeezed both columns on
+     a phone and clipped table cells; the desk reads this on a laptop, but a
+     clipped number is worse than a stacked one. */
+  @media (max-width:900px){
+    main{grid-template-columns:1fr}
+    .strip .v{font-size:19px}
+    .strip{gap:16px}
+    .scroll{max-height:none}
+  }
 </style>
 </head>
 <body>
@@ -96,6 +120,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <label class="stat"><input type="checkbox" id="paperToggle" checked> auto-trade</label>
   <button id="btnPause">Pause feed</button>
 </header>
+
+<div class="strip">
+  <div class="cell"><span class="k">Net PnL</span><span class="v dim" id="sNet">-</span></div>
+  <div class="cell"><span class="k">Hold</span><span class="v" id="sHold">-</span></div>
+  <div class="cell"><span class="k">Exits</span><span class="v" id="sExits">-</span></div>
+  <div class="cell"><span class="k">Live</span><span class="v dim" id="sLive">-</span></div>
+  <span class="stale" id="sStale" style="display:none"></span>
+</div>
 
 <main>
   <section class="panel">
@@ -114,18 +146,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   <div style="display:flex;flex-direction:column;gap:10px">
     <section class="panel">
-      <h2><span>Paper account</span><span id="paperMeta" class="stat"></span></h2>
-      <div class="kv" id="paper"></div>
-    </section>
-    <section class="panel">
-      <h2><span>Open positions</span></h2>
-      <div class="scroll" style="max-height:22vh"><table id="positions"></table></div>
-    </section>
-    <section class="panel">
-      <h2><span>Closed trades</span></h2>
-      <div class="scroll" style="max-height:22vh"><table id="trades-log"></table></div>
-    </section>
-    <section class="panel">
       <h2><span>Cumulative delta</span><span id="cumMeta" class="stat"></span></h2>
       <canvas id="cum" height="150"></canvas>
     </section>
@@ -140,6 +160,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <section class="panel">
       <h2><span>Session</span></h2>
       <div class="kv" id="session"></div>
+    </section>
+    <section class="panel">
+      <h2><span>Paper account</span><span id="paperMeta" class="stat"></span></h2>
+      <div class="kv" id="paper"></div>
+    </section>
+    <section class="panel">
+      <h2><span>Open positions</span></h2>
+      <div class="scroll" style="max-height:22vh"><table id="positions"></table></div>
+    </section>
+    <section class="panel">
+      <h2><span>Closed trades</span></h2>
+      <div class="scroll" style="max-height:22vh"><table id="trades-log"></table></div>
     </section>
   </div>
 </main>
@@ -170,11 +202,13 @@ function renderTabs(watchlist){
 
 function renderFootprint(chart){
   const bars = chart.bars || [];
-  $("chartMeta").textContent =
-    `${chart.symbol||""} · ${bars.length} bars · ${chart.bar_seconds||0}s`;
+  $("chartMeta").textContent = bars.length
+    ? `${chart.symbol||""} · ${bars.length} bars · ${chart.bar_seconds||0}s`
+    : (chart.symbol ? `${chart.symbol} · no bars` : "");
   if(!bars.length){
-    $("fp").innerHTML = `<div class="hint">No bars yet. Start the feed, or
-      replay a capture. Bars appear once trades land inside a session.</div>`;
+    $("fp").innerHTML = `<div class="hint">No bars yet. The feed comes up on
+      its own; bars appear once trades land inside a session. To check the
+      engine off-session, replay a capture below.</div>`;
     return;
   }
   const bar = bars[bars.length-1];
@@ -269,20 +303,58 @@ function renderSession(chart){
   const bars = chart.bars||[];
   const last = bars[bars.length-1];
   const cum = (chart.cumulative_delta||[]);
-  const cd = cum.length ? cum[cum.length-1].d : 0;
+  const cd = cum.length ? cum[cum.length-1].d : null;
+  // No chart means no data, and the panel must say so. A zero bar size and a
+  // zero cumulative delta look like a broken feed; a dash reads as "nothing
+  // here yet", which is the truth.
+  const has = bars.length > 0;
   const rows = [
-    ["symbol", chart.symbol||chart.label||"-"],
-    ["session", chart.session||"-"],
-    ["bar size", (chart.bar_seconds||0)+"s"],
-    ["tick", fmt(chart.tick)],
+    ["symbol", chart.symbol || chart.label || "-"],
+    ["session", chart.session || "-"],
+    ["bar size", has ? (chart.bar_seconds||0)+"s" : "-"],
+    ["tick", has ? fmt(chart.tick) : "-"],
     ["last", last?fmt(last.close):"-"],
     ["bar volume", last?int(last.volume):"-"],
     ["bar delta", last?int(last.delta):"-"],
-    ["cum delta", int(cd)],
+    ["cum delta", cd===null?"-":int(cd)],
     ["bars", bars.length],
   ];
   $("session").innerHTML = rows.map(([k,v])=>
     `<div>${k}</div><div>${v}</div>`).join("");
+}
+
+function setStrip(id, text, cls){
+  const el = $(id);
+  el.textContent = text;
+  el.className = "v" + (cls ? " " + cls : "");
+}
+
+function renderStrip(s, stale){
+  const p = (stale && s.last_session) ? s.last_session.paper : s.paper;
+  const acct = p || {};
+  // No account means no numbers, not zero numbers. A run with paper trading off
+  // has no PnL and no exits, and showing "0" would read as a flat session.
+  const hasAcct = p !== null && p !== undefined;
+  const net = hasAcct ? acct.net_pnl : null;
+  setStrip("sNet", net===null||net===undefined ? "-" : int(net),
+           net===null||net===undefined ? "dim" : (net>=0 ? "pos" : "neg"));
+  setStrip("sHold", hasAcct ? int((acct.positions||[]).length) : "-",
+           hasAcct ? "" : "dim");
+  setStrip("sExits", hasAcct ? int(acct.exits) : "-", hasAcct ? "" : "dim");
+  const live = s.running
+    ? (s.feed && s.feed.state ? s.feed.state : s.status)
+    : (s.live_configured ? "paused" : "no session");
+  setStrip("sLive", live, s.running ? "pos" : "dim");
+
+  const pill = $("sStale");
+  if(stale && s.last_session && s.last_session.saved_at){
+    const when = new Date(s.last_session.saved_at*1000).toLocaleString();
+    pill.textContent = `showing last session · ${when}`;
+    pill.className = "stale warn";
+    pill.style.display = "";
+  } else {
+    pill.style.display = "none";
+  }
 }
 
 function renderPaper(p){
@@ -327,18 +399,31 @@ function renderPaper(p){
 }
 
 let WATCH = [];
+let STALE = false;
 async function tick(){
   try{
     const r = await fetch("/api/status"); const s = await r.json();
     WATCH = s.watchlist||[];
     renderTabs(WATCH);
+    // Nothing running and nothing received this process: whatever the page
+    // shows can only come from the last saved session. This is what stops a
+    // fresh boot from reading as a dead engine.
+    STALE = !s.running && !s.ticks && !!s.last_session;
     $("ticks").textContent = s.ticks;
     $("trades").textContent = s.trades;
     $("src").textContent = s.source;
-    $("feedState").textContent = s.running ? s.status : "paused";
     $("last").textContent = s.last_tick_at
       ? new Date(s.last_tick_at*1000).toLocaleTimeString() : "-";
     $("status").textContent = s.status;
+    // The feed line says *why* there is no stream, not just that there is none.
+    let feedTxt = s.running ? s.status : "paused";
+    if(!s.running && !s.live_configured) feedTxt = "no live session";
+    else if(s.feed && s.feed.state) feedTxt = s.feed.state;
+    if(s.feed && s.feed.next_open_at && s.feed.state === "waiting"){
+      feedTxt += " · next open "
+        + new Date(s.feed.next_open_at*1000).toLocaleTimeString();
+    }
+    $("feedState").textContent = feedTxt;
     const dot = $("dot");
     dot.className = "dot" + (s.status==="streaming" ? " on"
                   : s.status==="error" ? " err" : "");
@@ -347,16 +432,28 @@ async function tick(){
 
     // Paper trading is on by default and the engine trades on its own; the
     // page only reports what it did. There is no per-trade button by design.
+    const paper = STALE ? (s.last_session||{}).paper : s.paper;
+    // The toggle reflects the *current* configuration, never the stale one:
+    // flipping a checkbox to match a saved session would misrepresent whether
+    // the engine is trading now.
     const paperOn = s.paper !== null && s.paper !== undefined;
     const pill = $("paperPill");
     pill.textContent = paperOn ? "on" : "off";
     pill.className = "pill " + (paperOn ? "on" : "off");
     $("paperToggle").checked = paperOn;
-    renderPaper(s.paper);
+    renderPaper(paper);
+    renderStrip(s, STALE);
 
     if(SEL){
-      const cr = await fetch(`/api/chart/${encodeURIComponent(SEL)}`);
-      const ch = await cr.json();
+      let ch;
+      const cached = STALE && s.last_session && s.last_session.charts
+        ? s.last_session.charts[SEL] : null;
+      if(cached){
+        ch = cached;
+      } else {
+        const cr = await fetch(`/api/chart/${encodeURIComponent(SEL)}`);
+        ch = await cr.json();
+      }
       renderFootprint(ch);
       drawLine($("cum"), ch.cumulative_delta||[], "#00d1ff");
       drawDeltaBars($("dbars"), (ch.bars||[]).slice(-60));

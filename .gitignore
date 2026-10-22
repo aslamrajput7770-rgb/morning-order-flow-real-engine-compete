@@ -17,3 +17,6 @@ recordings/
 *.oft.gz
 *.oft.gz.part
 *.part.orphan
+
+# Last-session snapshot: a local cache of the previous run, machine-specific.
+last_session.json
