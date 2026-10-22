@@ -143,7 +143,9 @@ class AlwaysOnFeed:
                     on_trade=self._on_trade,
                     max_seconds=budget,
                     reconnect=True,
-                    should_stop=self.stopping,
+                    # The connector calls this between frames, so it must be the
+                    # bound method, not the `stopping` property's value.
+                    should_stop=self._stop.is_set,
                 )
                 self._absorb(stats)
                 # A clean end of a run is normal: either the budget elapsed or
