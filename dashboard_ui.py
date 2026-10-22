@@ -400,10 +400,15 @@ function renderPaper(p){
 
 let WATCH = [];
 let STALE = false;
+let RUNNING = false;
 async function tick(){
   try{
     const r = await fetch("/api/status"); const s = await r.json();
     WATCH = s.watchlist||[];
+    RUNNING = !!s.running;
+    // The one feed button says what it will do, so a stray click is never a
+    // surprise: "Pause feed" while streaming, "Start live" while stopped.
+    $("btnPause").textContent = s.running ? "Pause feed" : "Start live";
     renderTabs(WATCH);
     // Nothing running and nothing received this process: whatever the page
     // shows can only come from the last saved session. This is what stops a
@@ -470,7 +475,19 @@ async function post(url, body){
     body: JSON.stringify(body||{})});
   return r.json();
 }
-$("btnPause").onclick = () => post("/api/feed/stop", {});
+$("btnPause").onclick = async () => {
+  // One button, two jobs. It used to only ever stop, so a stray click killed
+  // the feed for the rest of the process with no way back from the page --
+  // exactly the trap the desk fell into. Now it mirrors the feed state: while
+  // streaming it pauses, while stopped it brings the live session back.
+  if(RUNNING){
+    await post("/api/feed/stop", {});
+  } else {
+    const r = await post("/api/feed/start", {mode:"live"});
+    if(r.detail) alert(r.detail);
+  }
+  tick();
+};
 $("paperToggle").onchange = async (e) => {
   await post("/api/paper", {enabled: e.target.checked});
 };

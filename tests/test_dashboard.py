@@ -1015,3 +1015,21 @@ class TestPageLayout:
 
         assert 'has ? (chart.bar_seconds||0)+"s" : "-"' in INDEX_HTML
         assert "no bars" in INDEX_HTML
+
+    def test_the_feed_button_can_start_the_feed_again(self):
+        """Pausing must never be a one-way door.
+
+        The button used to only ever POST /api/feed/stop, with no way back from
+        the page: one stray click ended the session for the life of the process
+        and the desk had to restart the server. A feed that cannot be resumed is
+        not an always-on feed. Assert the handler reaches both endpoints and
+        that the label tracks the state.
+        """
+        from dashboard_ui import INDEX_HTML
+
+        assert '/api/feed/stop' in INDEX_HTML
+        assert '/api/feed/start' in INDEX_HTML, (
+            "the page can pause but never resume: a one-way door")
+        assert '"Start live"' in INDEX_HTML
+        assert '"Pause feed"' in INDEX_HTML
+
