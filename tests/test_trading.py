@@ -425,6 +425,33 @@ class TestAlwaysOnFeed:
         assert polls["n"] == 1
         assert feed.health.stopped
 
+    def test_connector_receives_a_callable_stop_hook(self):
+        """The hook handed to the connector must be callable, not a bool.
+
+        The connector polls `should_stop()` between frames. Passing the
+        `stopping` property's value instead hands over a bool, which raises
+        "'bool' object is not callable" on the first frame. The supervisor's
+        broad `except` swallows that, so the feed dies with zero ticks and no
+        visible error -- the test above passes either way, because the fake
+        stops the feed before the bad call is ever reached. Assert the shape.
+        """
+        from orderflow.supervisor import AlwaysOnFeed
+
+        class FakeConn:
+            def run(self, on_trade=None, max_seconds=None, reconnect=True,
+                    should_stop=None):
+                assert callable(should_stop), (
+                    f"should_stop must be callable, got {should_stop!r}")
+                assert should_stop() is False, "must read False while running"
+                feed.stop()
+                assert should_stop() is True, "must read True after stop()"
+                return type("S", (), {"frames": 0, "reconnects": 0})()
+
+        feed = AlwaysOnFeed(self._calendar(), lambda: FakeConn(),
+                            clock=self._open_clock())
+        feed.run()
+        assert feed.health.state != "error", feed.health.detail
+
 
 class TestUnionCalendar:
     """A mixed NSE+MCX watchlist must stay open while either market trades."""
